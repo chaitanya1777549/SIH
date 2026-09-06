@@ -16,6 +16,26 @@
       "destination": "https://sih26027-backend-zlbr.onrender.com/departments/:path*"
     },
     {
+      "source": "/emergency/:path*",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/emergency/:path*"
+    },
+    {
+      "source": "/optimize/:path*",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/optimize/:path*"
+    },
+    {
+      "source": "/reoptimize/:path*",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/reoptimize/:path*"
+    },
+    {
+      "source": "/shadow/:path*",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/shadow/:path*"
+    },
+    {
+      "source": "/voice-tester/:path*",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/voice-tester/:path*"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }
