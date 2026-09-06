@@ -1,4 +1,4 @@
-﻿# SIH26027 Automatic Block Planning System - Production Python Dependencies
+# SIH26027 Automatic Block Planning System - Production Python Dependencies
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 gunicorn>=23.0.0

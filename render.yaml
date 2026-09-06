@@ -1,4 +1,4 @@
-﻿services:
+services:
   - type: web
     name: sih26027-backend
     env: python
