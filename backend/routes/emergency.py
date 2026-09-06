@@ -7,10 +7,12 @@ Provides:
 - Controller decision confirmation with atomic emergency block creation
 - Safety release and corridor reopening lifecycle
 """
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Dict, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, joinedload
 
 from backend.database import get_db
@@ -30,6 +32,7 @@ from backend.emergency.engine import (
     generate_emergency_block_options,
     confirm_emergency_decision,
     advance_incident_lifecycle,
+    evaluate_crucial_defect_pipeline,
 )
 
 router = APIRouter(prefix="/coa/emergency", tags=["Emergency Mode"])
@@ -171,3 +174,74 @@ def advance_incident_status(
         target_status=payload.target_status,
         officer_notes=payload.notes,
     )
+
+
+class CrucialDefectEvaluateSchema(BaseModel):
+    source_system: str = Field(..., description="TMS, SMMS, or TDMS")
+    block_section_id: UUID = Field(..., description="Target block section UUID")
+    reason: str = Field(..., description="Technical description / reason for crucial defect")
+    estimated_duration_min: int = Field(..., gt=0, description="Estimated duration in minutes required for repair")
+    required_by_minutes: Optional[int] = Field(120, description="Deadline in minutes from now before which defect must be resolved")
+    defect_type: Optional[str] = None
+    defect_id: Optional[UUID] = None
+
+
+@router.post("/evaluate-crucial")
+def evaluate_crucial_defect(
+    payload: CrucialDefectEvaluateSchema,
+    db: Session = Depends(get_db)
+):
+    """
+    Automated triage pipeline for crucial department defects:
+    1. Check Free Gap before deadline -> Schedule standard block (no emergency).
+    2. Check Shadow Block before deadline -> Propose piggyback (no emergency).
+    3. Neither available -> AUTOMATICALLY INVOKE EMERGENCY MODE (COA Siren Alert + Options).
+    """
+    now = datetime.now(timezone.utc)
+    deadline = now + timedelta(minutes=payload.required_by_minutes or 120)
+    return evaluate_crucial_defect_pipeline(
+        db=db,
+        source_system=payload.source_system,
+        block_section_id=payload.block_section_id,
+        reason=payload.reason,
+        estimated_duration_min=payload.estimated_duration_min,
+        required_by=deadline,
+        defect_id=payload.defect_id,
+        defect_type=payload.defect_type,
+    )
+
+
+@router.get("/active-alert")
+def get_active_emergency_alert(
+    db: Session = Depends(get_db)
+):
+    """
+    Returns active emergency state on the corridor for triggering siren alarm and red banners in COA.
+    """
+    active_incident = (
+        db.query(EmergencyIncident)
+        .options(joinedload(EmergencyIncident.block_section))
+        .filter(EmergencyIncident.status.in_(["reported", "action_recommended", "escalated_emergency"]))
+        .order_by(EmergencyIncident.created_at.desc())
+        .first()
+    )
+    if not active_incident:
+        return {
+            "has_active_emergency": False,
+            "should_sound_siren": False,
+            "incident": None,
+        }
+
+    return {
+        "has_active_emergency": True,
+        "should_sound_siren": True,
+        "incident": {
+            "id": str(active_incident.id),
+            "source_system": active_incident.source_system,
+            "section_code": active_incident.block_section.section_code if active_incident.block_section else "CORRIDOR",
+            "reported_text": active_incident.reported_text,
+            "status": active_incident.status,
+            "created_at": active_incident.created_at.isoformat(),
+        }
+    }
+

@@ -266,9 +266,11 @@ export const GanttTimeline: React.FC<GanttTimelineProps> = ({
       const y2 = stationYMap.get(stn2);
 
       const startMin = toMinutes(b.planned_start);
-      const endMin = toMinutes(b.planned_end);
+      const rawEndMin = toMinutes(b.planned_end);
+      // If block crosses midnight, on this day it runs until 24:00 (1440 min)
+      const effectiveEndMin = rawEndMin < startMin ? 1440 : rawEndMin;
       const startX = STATION_COL_WIDTH + minToX(startMin);
-      const endX = STATION_COL_WIDTH + minToX(endMin);
+      const endX = STATION_COL_WIDTH + minToX(effectiveEndMin);
       const width = Math.max(14, endX - startX);
 
       let topY = 0;
@@ -281,6 +283,8 @@ export const GanttTimeline: React.FC<GanttTimelineProps> = ({
         height = 30;
       }
 
+      const totalDurationMin = b.duration_min || Math.round((new Date(b.planned_end).getTime() - new Date(b.planned_start).getTime()) / 60000);
+
       return {
         block: b,
         startX,
@@ -291,10 +295,10 @@ export const GanttTimeline: React.FC<GanttTimelineProps> = ({
         stn2,
         isUp,
         isShadow: b.block_type === 'shadow',
-        durationMin: Math.round(endMin - startMin),
+        durationMin: totalDurationMin,
       };
     });
-  }, [blocks, stationYMap, zoomLevel]);
+  }, [blocks, stationYMap, zoomLevel, selectedDate]);
 
   // Jump to specific hour in scroll container
   const jumpToHour = (hour: number) => {

@@ -142,6 +142,7 @@ class DefectCreateSchema(BaseModel):
     input_source: InputSource = Field(InputSource.manual, description="Input source (manual, nl_intake, emergency).")
     raw_report_text: Optional[str] = Field(None, description="Original report text if from voice or NL intake.")
     requires_block: bool = Field(True, description="Whether this defect requires a maintenance block.")
+    is_crucial_emergency: bool = Field(False, description="Whether this defect is marked as crucial/emergency by department")
 
 class DefectResponseSchema(BaseModel):
     id: UUID
@@ -164,6 +165,7 @@ class DefectResponseSchema(BaseModel):
     work_category: str
     input_source: str
     raw_report_text: Optional[str] = None
+    emergency_cascade: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -312,7 +314,7 @@ class TrainDelayUpdateResponseSchema(BaseModel):
 class ReOptimizeRequestSchema(BaseModel):
     service_date: date = Field(..., description="Service date for re-optimization (YYYY-MM-DD)")
     section_code: Optional[str] = Field(None, description="Optional specific block section code (e.g. 'AKP-TUNI-DN')")
-    criticality_threshold: int = Field(70, ge=0, le=100, description="Score threshold: >= threshold diverts train; < threshold revokes block and reschedules")
+    criticality_threshold: int = Field(60, ge=0, le=100, description="Score threshold: >= threshold diverts/halts train; < threshold revokes block and reschedules")
 
 class ConflictResolutionDetailSchema(BaseModel):
     conflict_type: str
@@ -357,7 +359,7 @@ class DelayAndReoptimizeRequestSchema(BaseModel):
     service_date: date = Field(..., description="Service date (YYYY-MM-DD)")
     station_code: str = Field(..., description="Station code where delay is reported, e.g. 'AKP'")
     delay_minutes: int = Field(..., ge=0, description="Delay duration in minutes (e.g. 30)")
-    criticality_threshold: int = Field(70, ge=0, le=100, description="Threshold for train diversion vs. maintenance revocation")
+    criticality_threshold: int = Field(60, ge=0, le=100, description="Threshold for train diversion vs. maintenance revocation")
 
 
 # --- ML Criticality Scoring & Explainability Schemas ---

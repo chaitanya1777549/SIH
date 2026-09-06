@@ -26,6 +26,7 @@ export const App: React.FC = () => {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [isVoiceModalOpen, setIsVoiceModalOpen] = useState<boolean>(false);
   const [isManualModalOpen, setIsManualModalOpen] = useState<boolean>(false);
+  const [targetEmergencyIncidentId, setTargetEmergencyIncidentId] = useState<string | null>(null);
 
   // 1. Load corridor block sections on mount
   useEffect(() => {
@@ -149,7 +150,7 @@ export const App: React.FC = () => {
 
         {activeView === 'COA' ? (
           /* COA MASTER INTERFACE */
-          <CoaDashboard />
+          <CoaDashboard targetIncidentId={targetEmergencyIncidentId} />
         ) : (
           /* DEPARTMENTAL INTERFACE (TMS, SMMS, TDMS) */
           <>
@@ -198,6 +199,11 @@ export const App: React.FC = () => {
         department={department}
         sections={sections}
         onDefectCreated={() => loadData(true)}
+        onSwitchToCoaEmergency={(incidentId) => {
+          if (incidentId) setTargetEmergencyIncidentId(incidentId);
+          setActiveView('COA');
+          setIsManualModalOpen(false);
+        }}
       />
 
       {/* Simple Clean Footer */}

@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { Station, BlockSection, TrainMovement, CorridorBlock } from '../../types';
-import { Clock, Play, Pause, RotateCcw, Train, Info } from 'lucide-react';
+import { Clock, Play, Pause, RotateCcw, Train, Info, ShieldAlert, Ban, AlertTriangle } from 'lucide-react';
 
 interface CorridorTrackMapProps {
   stations: Station[];
@@ -40,6 +40,21 @@ export const CorridorTrackMap: React.FC<CorridorTrackMapProps> = ({
     return `${h}:${m}`;
   };
 
+  // Check if an ISO timestamp or date matches selectedDate
+  const isDateMatch = (isoString?: string) => {
+    if (!isoString) return false;
+    try {
+      if (isoString.startsWith(selectedDate)) return true;
+      const d = new Date(isoString);
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}` === selectedDate;
+    } catch {
+      return false;
+    }
+  };
+
   // Convert an ISO timestamp to minutes of day
   const toMinutesOfDay = (isoString: string) => {
     try {
@@ -50,35 +65,110 @@ export const CorridorTrackMap: React.FC<CorridorTrackMapProps> = ({
     }
   };
 
-  // Determine active blocks at current scrubber time
+  // Convert selectedDate + timeMin into an absolute timestamp for current scrubber position
+  const currentScrubberMs = useMemo(() => {
+    try {
+      const [y, m, d] = selectedDate.split('-').map(Number);
+      const h = Math.floor(timeMin / 60);
+      const min = timeMin % 60;
+      return new Date(y, m - 1, d, h, min, 0).getTime();
+    } catch {
+      return 0;
+    }
+  }, [selectedDate, timeMin]);
+
+  // Determine active blocks on selectedDate at current scrubber time
   const activeBlocksBySection = useMemo(() => {
     const map = new Map<string, CorridorBlock[]>();
     blocks.forEach((b) => {
-      const startMin = toMinutesOfDay(b.planned_start);
-      const endMin = toMinutesOfDay(b.planned_end);
-      if (timeMin >= startMin && timeMin <= endMin) {
+      // Must match selectedDate
+      if (!isDateMatch(b.planned_start) && !isDateMatch(b.planned_end)) return;
+      // Do not display completed or cancelled blocks as active
+      if (b.status === 'completed' || b.status === 'cancelled') return;
+
+      const startMs = new Date(b.planned_start).getTime();
+      const endMs = new Date(b.planned_end).getTime();
+
+      // Check if current scrubber timestamp is inside block window (bulletproof against midnight wraparound)
+      if (currentScrubberMs >= startMs && currentScrubberMs <= endMs) {
         const list = map.get(b.block_section_id) || [];
         list.push(b);
         map.set(b.block_section_id, list);
       }
     });
     return map;
-  }, [blocks, timeMin]);
+  }, [blocks, currentScrubberMs, selectedDate]);
 
-  // Determine trains on corridor at current scrubber time
+  // Determine trains on corridor on selectedDate at current scrubber time
   const activeTrainsBySection = useMemo(() => {
     const map = new Map<string, TrainMovement[]>();
     trains.forEach((t) => {
-      const entryMin = toMinutesOfDay(t.forecast_entry || t.scheduled_entry);
-      const exitMin = toMinutesOfDay(t.forecast_exit || t.scheduled_exit);
-      if (timeMin >= entryMin && timeMin <= exitMin) {
+      const entryDate = t.forecast_entry || t.scheduled_entry;
+      if (!isDateMatch(entryDate) && t.service_date !== selectedDate) return;
+
+      const entryMs = new Date(t.forecast_entry || t.scheduled_entry).getTime();
+      const exitMs = new Date(t.forecast_exit || t.scheduled_exit).getTime();
+
+      if (currentScrubberMs >= entryMs && currentScrubberMs <= exitMs) {
         const list = map.get(t.block_section_id) || [];
         list.push(t);
         map.set(t.block_section_id, list);
       }
     });
     return map;
-  }, [trains, timeMin]);
+  }, [trains, currentScrubberMs, selectedDate]);
+
+  // Determine trains currently regulated / held at station loop lines due to downstream blocks
+  const heldTrainsByStation = useMemo(() => {
+    const map = new Map<string, { train: TrainMovement; reason: string; sectionCode: string }[]>();
+
+    sections.forEach((sec) => {
+      const activeBlks = activeBlocksBySection.get(sec.id) || [];
+      if (activeBlks.length === 0) return;
+
+      const blockStartMs = Math.min(...activeBlks.map((b) => new Date(b.planned_start).getTime()));
+      const blockEndMs = Math.max(...activeBlks.map((b) => new Date(b.planned_end).getTime()));
+
+      // Upstream station where trains wait for line clear
+      const upstreamStnCode = sec.from_station_code;
+      if (!upstreamStnCode) return;
+
+      trains.forEach((t) => {
+        if (t.block_section_id !== sec.id) return;
+        const entryDate = t.forecast_entry || t.scheduled_entry;
+        if (!isDateMatch(entryDate) && t.service_date !== selectedDate) return;
+
+        const schedEntryMs = new Date(t.scheduled_entry).getTime();
+        const fcastEntryMs = new Date(t.forecast_entry || t.scheduled_entry).getTime();
+
+        // Train is affected if its schedule falls inside/before the block window,
+        // and currently at timeMin the train hasn't entered the section (held awaiting clearance)
+        const isAffected =
+          (schedEntryMs >= blockStartMs - 15 * 60 * 1000 && schedEntryMs <= blockEndMs) ||
+          (t.delay_minutes > 0 && fcastEntryMs >= blockEndMs);
+
+        if (
+          isAffected &&
+          currentScrubberMs >= Math.max(0, schedEntryMs - 15 * 60 * 1000) &&
+          currentScrubberMs < fcastEntryMs
+        ) {
+          const list = map.get(upstreamStnCode) || [];
+          if (!list.some((item) => item.train.train_number === t.train_number)) {
+            list.push({
+              train: t,
+              reason: activeBlks.some((b) => b.is_emergency || b.status === 'emergency')
+                ? 'Emergency Possession'
+                : 'Maintenance Block Possession',
+              sectionCode: sec.section_code,
+            });
+            map.set(upstreamStnCode, list);
+          }
+        }
+      });
+    });
+
+    return map;
+  }, [sections, activeBlocksBySection, trains, currentScrubberMs, selectedDate]);
 
   // Sort stations geographically VSKP -> BZA
   const sortedStations = useMemo(() => {
@@ -252,29 +342,48 @@ export const CorridorTrackMap: React.FC<CorridorTrackMapProps> = ({
 
             {/* Grid of Station Nodes */}
             <div className="flex justify-between items-start relative z-10 px-2">
-              {sortedStations.map((stn, idx) => (
-                <div key={stn.id} className="flex flex-col items-center group relative">
-                  {/* Station Code Badge */}
-                  <div className="w-10 h-10 rounded-xl bg-slate-900 border-2 border-slate-700 group-hover:border-indigo-400 text-white flex items-center justify-center font-mono font-extrabold text-xs shadow-lg transition-all duration-150">
-                    {stn.station_code}
-                  </div>
+              {sortedStations.map((stn, idx) => {
+                const heldAtStn = heldTrainsByStation.get(stn.station_code) || [];
+                return (
+                  <div key={stn.id} className="flex flex-col items-center group relative">
+                    {/* Station Code Badge */}
+                    <div className="w-10 h-10 rounded-xl bg-slate-900 border-2 border-slate-700 group-hover:border-indigo-400 text-white flex items-center justify-center font-mono font-extrabold text-xs shadow-lg transition-all duration-150">
+                      {stn.station_code}
+                    </div>
 
-                  {/* Station Name & KM */}
-                  <div className="text-center mt-2">
-                    <span className="text-[11px] font-bold text-slate-200 block truncate max-w-[85px]">
-                      {stn.station_name}
-                    </span>
-                    <span className="text-[10px] text-slate-500 font-mono">
-                      km {stn.distance_from_origin_km || idx * 30}
-                    </span>
-                  </div>
+                    {/* Station Name & KM */}
+                    <div className="text-center mt-2">
+                      <span className="text-[11px] font-bold text-slate-200 block truncate max-w-[85px]">
+                        {stn.station_name}
+                      </span>
+                      <span className="text-[10px] text-slate-500 font-mono">
+                        km {stn.distance_from_origin_km || idx * 30}
+                      </span>
+                    </div>
 
-                  {/* DOWN Track Point */}
-                  <div className="absolute top-[28px] w-3.5 h-3.5 rounded-full bg-slate-700 border-2 border-slate-900 group-hover:bg-emerald-400 transition" />
-                  {/* UP Track Point */}
-                  <div className="absolute top-[78px] w-3.5 h-3.5 rounded-full bg-slate-700 border-2 border-slate-900 group-hover:bg-sky-400 transition" />
-                </div>
-              ))}
+                    {/* Station Loop Lines Regulation Display */}
+                    {heldAtStn.length > 0 && (
+                      <div className="mt-2 flex flex-col items-center gap-1 z-30 animate-in fade-in duration-200">
+                        {heldAtStn.map(({ train: ht, reason, sectionCode }) => (
+                          <div
+                            key={ht.id}
+                            className="px-2 py-0.5 rounded-lg bg-amber-500/20 border border-amber-500/80 text-amber-200 text-[9px] font-mono font-bold flex items-center gap-1 shadow-md animate-pulse whitespace-nowrap"
+                            title={`Regulated at ${stn.station_code} Loop Line: Train #${ht.train_number} awaiting Line Clear for ${sectionCode} (${reason})`}
+                          >
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                            <span>🛑 Loop: #{ht.train_number}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* DOWN Track Point */}
+                    <div className="absolute top-[28px] w-3.5 h-3.5 rounded-full bg-slate-700 border-2 border-slate-900 group-hover:bg-emerald-400 transition" />
+                    {/* UP Track Point */}
+                    <div className="absolute top-[78px] w-3.5 h-3.5 rounded-full bg-slate-700 border-2 border-slate-900 group-hover:bg-sky-400 transition" />
+                  </div>
+                );
+              })}
             </div>
 
             {/* Block Section Segments (Overlaid on tracks) */}
@@ -316,20 +425,32 @@ export const CorridorTrackMap: React.FC<CorridorTrackMapProps> = ({
                         )}
                       </div>
 
-                      {/* Moving Trains on Section */}
-                      {activeTrns.length > 0 && (
-                        <div className="mt-1 flex flex-wrap gap-1 justify-center">
-                          {activeTrns.map((t) => (
-                            <span
-                              key={t.id}
-                              className="inline-flex items-center gap-0.5 bg-sky-500 text-white px-1.5 py-0.5 rounded text-[9px] font-mono font-bold shadow"
-                              title={`${t.train_number} - ${t.train_name || ''} (Delay: ${t.delay_minutes}m)`}
-                            >
-                              🚆 {t.train_number}
-                              {t.delay_minutes > 0 && <span className="text-amber-200">+{t.delay_minutes}m</span>}
-                            </span>
-                          ))}
+                      {/* Section Content: Interlocking ensures NO train enters blocked section */}
+                      {isBlocked ? (
+                        <div className="mt-1 flex flex-col items-center justify-center py-1 px-1 rounded bg-black/40 border border-rose-500/30">
+                          <span className="inline-flex items-center gap-1 text-[9px] font-bold text-rose-300">
+                            <Ban className="w-3 h-3 text-rose-400 shrink-0" />
+                            <span>TRACK BLOCKED</span>
+                          </span>
+                          <span className="text-[8px] text-slate-300 font-sans tracking-tight">
+                            Possession Active • Held in Loops
+                          </span>
                         </div>
+                      ) : (
+                        activeTrns.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1 justify-center">
+                            {activeTrns.map((t) => (
+                              <span
+                                key={t.id}
+                                className="inline-flex items-center gap-0.5 bg-sky-500 text-white px-1.5 py-0.5 rounded text-[9px] font-mono font-bold shadow"
+                                title={`${t.train_number} - ${t.train_name || ''} (Delay: ${t.delay_minutes}m)`}
+                              >
+                                🚆 {t.train_number}
+                                {t.delay_minutes > 0 && <span className="text-amber-200">+{t.delay_minutes}m</span>}
+                              </span>
+                            ))}
+                          </div>
+                        )
                       )}
                     </div>
                   );
@@ -373,20 +494,32 @@ export const CorridorTrackMap: React.FC<CorridorTrackMapProps> = ({
                         )}
                       </div>
 
-                      {/* Moving Trains on Section */}
-                      {activeTrns.length > 0 && (
-                        <div className="mt-1 flex flex-wrap gap-1 justify-center">
-                          {activeTrns.map((t) => (
-                            <span
-                              key={t.id}
-                              className="inline-flex items-center gap-0.5 bg-indigo-500 text-white px-1.5 py-0.5 rounded text-[9px] font-mono font-bold shadow"
-                              title={`${t.train_number} - ${t.train_name || ''} (Delay: ${t.delay_minutes}m)`}
-                            >
-                              🚆 {t.train_number}
-                              {t.delay_minutes > 0 && <span className="text-amber-200">+{t.delay_minutes}m</span>}
-                            </span>
-                          ))}
+                      {/* Section Content: Interlocking ensures NO train enters blocked section */}
+                      {isBlocked ? (
+                        <div className="mt-1 flex flex-col items-center justify-center py-1 px-1 rounded bg-black/40 border border-rose-500/30">
+                          <span className="inline-flex items-center gap-1 text-[9px] font-bold text-rose-300">
+                            <Ban className="w-3 h-3 text-rose-400 shrink-0" />
+                            <span>TRACK BLOCKED</span>
+                          </span>
+                          <span className="text-[8px] text-slate-300 font-sans tracking-tight">
+                            Possession Active • Held in Loops
+                          </span>
                         </div>
+                      ) : (
+                        activeTrns.length > 0 && (
+                          <div className="mt-1 flex flex-wrap gap-1 justify-center">
+                            {activeTrns.map((t) => (
+                              <span
+                                key={t.id}
+                                className="inline-flex items-center gap-0.5 bg-indigo-500 text-white px-1.5 py-0.5 rounded text-[9px] font-mono font-bold shadow"
+                                title={`${t.train_number} - ${t.train_name || ''} (Delay: ${t.delay_minutes}m)`}
+                              >
+                                🚆 {t.train_number}
+                                {t.delay_minutes > 0 && <span className="text-amber-200">+{t.delay_minutes}m</span>}
+                              </span>
+                            ))}
+                          </div>
+                        )
                       )}
                     </div>
                   );
@@ -414,20 +547,31 @@ export const CorridorTrackMap: React.FC<CorridorTrackMapProps> = ({
                 </div>
                 <div>
                   <span className="text-slate-500 text-[10px] block font-medium">Possession Status</span>
-                  <span className="font-bold text-emerald-400">
-                    {activeBlocksBySection.get(hoveredSection.id)?.length ? 'MAINTENANCE OCCUPIED' : 'CLEAR FOR TRAFFIC'}
-                  </span>
+                  {activeBlocksBySection.get(hoveredSection.id)?.length ? (
+                    <span className="font-bold text-rose-400 flex items-center gap-1">
+                      <Ban className="w-3 h-3 text-rose-500" />
+                      TRACK BLOCKED (POSSESSION)
+                    </span>
+                  ) : (
+                    <span className="font-bold text-emerald-400">CLEAR FOR TRAFFIC</span>
+                  )}
                 </div>
                 <div>
                   <span className="text-slate-500 text-[10px] block font-medium">Active Trains at {formatTime(timeMin)}</span>
-                  <span className="text-sky-400 font-bold font-mono">
-                    {activeTrainsBySection.get(hoveredSection.id)?.length || 0} trains
-                  </span>
+                  {activeBlocksBySection.get(hoveredSection.id)?.length ? (
+                    <span className="text-slate-400 font-bold font-mono text-[11px]">
+                      0 in section (Held in loops)
+                    </span>
+                  ) : (
+                    <span className="text-sky-400 font-bold font-mono">
+                      {activeTrainsBySection.get(hoveredSection.id)?.length || 0} trains
+                    </span>
+                  )}
                 </div>
                 <div>
-                  <span className="text-slate-500 text-[10px] block font-medium">Active Blocks at {formatTime(timeMin)}</span>
+                  <span className="text-slate-500 text-[10px] block font-medium">Active Blocks on {selectedDate}</span>
                   <span className="text-amber-400 font-bold font-mono">
-                    {activeBlocksBySection.get(hoveredSection.id)?.length || 0} blocks
+                    {activeBlocksBySection.get(hoveredSection.id)?.length || 0} active
                   </span>
                 </div>
               </div>

@@ -35,7 +35,7 @@ from backend.models import (
     TDMSDefect,
 )
 from backend.optimizer.gap_calculator import compute_section_free_gaps
-from backend.reoptimizer.engine import add_notification
+from backend.reoptimizer.engine import add_notification, propagate_train_delay
 
 logger = logging.getLogger("backend.emergency")
 
@@ -63,6 +63,7 @@ def create_emergency_incident(
     defect_type: Optional[str] = None,
     severity: Optional[str] = "critical",
     estimated_duration_min: int = 90,
+    required_by: Optional[datetime] = None,
 ) -> EmergencyIncident:
     """
     Ingests an emergency defect report and registers it into emergency_incidents.
@@ -81,7 +82,7 @@ def create_emergency_incident(
     tdms_id = None
 
     now = datetime.now(timezone.utc)
-    required_deadline = now + timedelta(hours=4) # Standard emergency 4-hour sustainable limit
+    required_deadline = required_by or (now + timedelta(hours=4)) # Standard emergency limit
 
     if defect_id:
         if source == "TMS":
@@ -280,9 +281,10 @@ def generate_emergency_block_options(
     )
     affected_numbers = [t.train.train_number for t in train_overlaps]
 
+    # Option 1: Emergency Track Block (Hold Approaching Trains at Loops)
     options.append({
         "option_id": "opt-immediate",
-        "label": "Option 1: Immediate Emergency Closure",
+        "label": "Option 1: Emergency Track Block (Hold Approaching Trains at Loops)",
         "planned_start": opt1_start.isoformat(),
         "planned_end": opt1_end.isoformat(),
         "duration_min": required_duration_min,
@@ -290,39 +292,73 @@ def generate_emergency_block_options(
         "affected_train_numbers": affected_numbers,
         "total_delay_minutes": opt1_total_delay,
         "is_shadow": False,
-        "resource_impact": "Full emergency maintenance crew & power/signal isolation required immediately.",
+        "resource_impact": "Full emergency possession & power/signal isolation. Holds conflicting trains at upstream loops.",
         "sustainable": True,
-        "description": f"Immediate line possession starting in 15m ({opt1_start.strftime('%H:%M')} - {opt1_end.strftime('%H:%M')}). Delays {opt1_trains_count} train(s) by {opt1_total_delay} min total.",
+        "description": f"Immediate line possession ({opt1_start.strftime('%H:%M')} - {opt1_end.strftime('%H:%M')}). Stables {opt1_trains_count} train(s) #{', #'.join(affected_numbers) if affected_numbers else 'none'} in loops (total delay: {opt1_total_delay}m).",
     })
 
-    # -------------------------------------------------------------
-    # Option 2: Targeted Single-Train Hold / Delay Trade-off
-    # -------------------------------------------------------------
-    # Check if delaying or holding a single train opens a clean 2-hour window
+    # Option 2: Single-Line Bi-Directional Working / Divert Traffic via Alternate Line
+    divert_delay = max(15, len(train_overlaps) * 20) if train_overlaps else 0
+    desc_opt2 = (
+        f"Diverts #{', #'.join(affected_numbers)} via opposite line under pilot caution order (30 km/h). Reduces delay to {divert_delay}m without dead-stabling trains."
+        if train_overlaps
+        else "Implement single-line pilot working on adjacent track to safeguard against incidental traffic during possession."
+    )
+    options.append({
+        "option_id": "opt-divert-single-line",
+        "label": "Option 2: Single-Line Working / Divert Traffic (30 km/h Pilot Caution)",
+        "planned_start": opt1_start.isoformat(),
+        "planned_end": opt1_end.isoformat(),
+        "duration_min": required_duration_min,
+        "trains_affected_count": len(train_overlaps),
+        "affected_train_numbers": affected_numbers,
+        "total_delay_minutes": divert_delay,
+        "is_shadow": False,
+        "resource_impact": "Bi-directional pilot working on adjacent track. Keeps traffic moving with caution speed.",
+        "sustainable": True,
+        "description": desc_opt2,
+    })
+
+    # Option 3: Targeted Single-Train Hold or Staggered Resource Possession
     if train_overlaps:
         first_train = min(train_overlaps, key=lambda t: t.forecast_entry)
         t_num = first_train.train.train_number
-        
-        # Scenario: Hold this single train at upstream station, giving a clean window
-        opt2_start = now + timedelta(minutes=20)
+        opt2_start = now + timedelta(minutes=25)
         opt2_end = opt2_start + timedelta(minutes=required_duration_min)
         single_delay = int((opt2_end - first_train.forecast_entry).total_seconds() // 60)
-        
-        if opt2_start <= max_safe_time:
-            options.append({
-                "option_id": "opt-single-train-hold",
-                "label": f"Option 2: Targeted Hold on Train {t_num}",
-                "planned_start": opt2_start.isoformat(),
-                "planned_end": opt2_end.isoformat(),
-                "duration_min": required_duration_min,
-                "trains_affected_count": 1,
-                "affected_train_numbers": [t_num],
-                "total_delay_minutes": max(20, single_delay),
-                "is_shadow": False,
-                "resource_impact": "Dedicated repair team; holds Train " + t_num + " at upstream loop line.",
-                "sustainable": True,
-                "description": f"Targeted intervention: Hold Train {t_num} by {max(20, single_delay)}m to secure uninterrupted {required_duration_min}m window from {opt2_start.strftime('%H:%M')} to {opt2_end.strftime('%H:%M')}.",
-            })
+        is_opt3_sustainable = opt2_start <= max_safe_time
+        options.append({
+            "option_id": "opt-single-train-hold",
+            "label": f"Option 3: Tactical Staggered Hold (Only Train {t_num} Regulated)",
+            "planned_start": opt2_start.isoformat(),
+            "planned_end": opt2_end.isoformat(),
+            "duration_min": required_duration_min,
+            "trains_affected_count": 1,
+            "affected_train_numbers": [t_num],
+            "total_delay_minutes": max(15, single_delay),
+            "is_shadow": False,
+            "resource_impact": "Dedicated repair gang; regulates only Train " + t_num + " at upstream loop line.",
+            "sustainable": is_opt3_sustainable,
+            "description": f"Targeted intervention: Regulate Train {t_num} by {max(15, single_delay)}m to secure uninterrupted {required_duration_min}m window from {opt2_start.strftime('%H:%M')} to {opt2_end.strftime('%H:%M')}." + ("" if is_opt3_sustainable else f" [Caution: Exceeds emergency deadline of {max_safe_time.strftime('%H:%M')}]."),
+        })
+    else:
+        opt3_start = now + timedelta(minutes=30)
+        opt3_end = opt3_start + timedelta(minutes=required_duration_min)
+        is_opt3_sustainable = opt3_start <= max_safe_time
+        options.append({
+            "option_id": "opt-staggered-window",
+            "label": "Option 3: Staggered Resource Possession (+30m Mobilization)",
+            "planned_start": opt3_start.isoformat(),
+            "planned_end": opt3_end.isoformat(),
+            "duration_min": required_duration_min,
+            "trains_affected_count": 0,
+            "affected_train_numbers": [],
+            "total_delay_minutes": 0,
+            "is_shadow": False,
+            "resource_impact": "Provides 30-min mobilization runway for tower wagon and maintenance gang dispatch.",
+            "sustainable": is_opt3_sustainable,
+            "description": f"Staggered start ({opt3_start.strftime('%H:%M')} - {opt3_end.strftime('%H:%M')}). Allows crew equipment staging with zero train delay." + ("" if is_opt3_sustainable else f" [Caution: Exceeds emergency deadline of {max_safe_time.strftime('%H:%M')}]."),
+        })
 
     # -------------------------------------------------------------
     # Option 3: Immediate Shadow Piggyback (Strict Sustainable Check)
@@ -521,24 +557,61 @@ def confirm_emergency_decision(
 
         incident.block_request_id = req.id
 
-        # Apply delay/hold to affected trains if Option 2 (Targeted Single-Train Hold)
-        if chosen_opt["option_id"] == "opt-single-train-hold" and chosen_opt.get("affected_train_numbers"):
-            target_train_no = chosen_opt["affected_train_numbers"][0]
-            delay_to_apply = chosen_opt["total_delay_minutes"]
+        # Regulate approaching trains at station loop lines and shift schedules past block release
+        affected_train_numbers = list(chosen_opt.get("affected_train_numbers", []))
+        service_dt = planned_start.date()
+
+        # Also find any trains that directly conflict with this block window on this section
+        active_overlaps = (
+            db.query(TrainSchedule)
+            .join(Train)
+            .filter(
+                TrainSchedule.block_section_id == sec.id,
+                TrainSchedule.service_date == service_dt,
+                TrainSchedule.forecast_entry <= planned_end + timedelta(minutes=5),
+                TrainSchedule.forecast_exit >= planned_start - timedelta(minutes=5),
+            )
+            .all()
+        )
+        for overlap in active_overlaps:
+            if overlap.train and overlap.train.train_number not in affected_train_numbers:
+                affected_train_numbers.append(overlap.train.train_number)
+
+        stn_code = sec.from_station.station_code if sec.from_station else None
+
+        for target_train_no in affected_train_numbers:
             sched_to_update = (
                 db.query(TrainSchedule)
                 .join(Train)
                 .filter(
                     Train.train_number == target_train_no,
                     TrainSchedule.block_section_id == sec.id,
-                    TrainSchedule.service_date == now.date(),
+                    TrainSchedule.service_date == service_dt,
                 )
                 .first()
             )
             if sched_to_update:
-                sched_to_update.delay_minutes += delay_to_apply
-                sched_to_update.forecast_entry = sched_to_update.scheduled_entry + timedelta(minutes=sched_to_update.delay_minutes)
-                sched_to_update.forecast_exit = sched_to_update.scheduled_exit + timedelta(minutes=sched_to_update.delay_minutes)
+                required_entry = planned_end + timedelta(minutes=5)
+                delay_needed = max(15, int((required_entry - sched_to_update.scheduled_entry).total_seconds() // 60))
+                propagated = False
+                if stn_code:
+                    try:
+                        propagate_train_delay(
+                            db=db,
+                            train_number=target_train_no,
+                            service_date=service_dt,
+                            station_code=stn_code,
+                            delay_minutes=delay_needed,
+                        )
+                        propagated = True
+                    except Exception as e:
+                        logger.warning(f"Downstream propagation failed for {target_train_no} at {stn_code}: {e}")
+
+                if not propagated:
+                    sched_to_update.delay_minutes = max(sched_to_update.delay_minutes, delay_needed)
+                    sched_to_update.forecast_entry = required_entry
+                    run_duration = sched_to_update.scheduled_exit - sched_to_update.scheduled_entry
+                    sched_to_update.forecast_exit = required_entry + run_duration
 
         add_notification(
             department=dept,
@@ -564,6 +637,14 @@ def confirm_emergency_decision(
     incident.status = "confirmed"
     incident.controller_decision = decision_lower
     incident.confirmed_at = now
+
+    # Also mark any other duplicate unconfirmed incidents on this section as superseded/confirmed
+    db.query(EmergencyIncident).filter(
+        EmergencyIncident.block_section_id == incident.block_section_id,
+        EmergencyIncident.id != incident.id,
+        EmergencyIncident.status.in_(["reported", "action_recommended", "escalated_emergency"])
+    ).update({"status": "confirmed", "controller_decision": "superseded"}, synchronize_session=False)
+
     db.commit()
 
     return {
@@ -645,3 +726,180 @@ def advance_incident_lifecycle(
         "new_status": target,
         "message": f"Incident transitioned to '{target}'.",
     }
+
+
+def evaluate_crucial_defect_pipeline(
+    db: Session,
+    source_system: str,
+    block_section_id: UUID,
+    reason: str,
+    estimated_duration_min: int,
+    required_by: Optional[datetime] = None,
+    defect_id: Optional[UUID] = None,
+    defect_type: Optional[str] = None,
+    reference_time: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """
+    Automated triage pipeline for crucial department defects:
+    1. Checks if a natural free gap can accommodate the defect before required_by.
+       If YES -> Schedules standard block request in that gap (No emergency escalation).
+    2. Checks if an active/planned primary block on the section can host a shadow block.
+       If YES -> Proposes shadow block piggyback (No emergency escalation).
+    3. If NEITHER a free gap NOR a shadow block is viable before deadline:
+       AUTOMATICALLY INVOKES EMERGENCY MODE!
+       Creates EmergencyIncident and generates multi-option tactical trade-off cards (Hold / Divert / Immediate Block).
+    """
+    now = reference_time or datetime.now(timezone.utc)
+    if not required_by or (required_by.tzinfo and required_by <= now):
+        required_by = now + timedelta(hours=2)
+    elif required_by.tzinfo is None:
+        required_by = required_by.replace(tzinfo=timezone.utc)
+
+    sec = db.query(BlockSection).filter(BlockSection.id == block_section_id).first()
+    if not sec:
+        raise HTTPException(status_code=404, detail=f"BlockSection '{block_section_id}' not found")
+
+    # -------------------------------------------------------------
+    # Cascade Step 1: Check Natural Free Gap before required_by
+    # -------------------------------------------------------------
+    scheds = (
+        db.query(TrainSchedule)
+        .filter(
+            TrainSchedule.block_section_id == sec.id,
+            TrainSchedule.service_date >= now.date(),
+            TrainSchedule.service_date <= (now + timedelta(days=1)).date(),
+            TrainSchedule.status.in_(["scheduled", "running"]),
+        )
+        .all()
+    )
+    train_moves = [(t.forecast_entry, t.forecast_exit) for t in scheds]
+
+    blocks = (
+        db.query(Block)
+        .filter(
+            Block.block_section_id == sec.id,
+            Block.status == "active",
+        )
+        .all()
+    )
+    block_moves = [(b.planned_start, b.planned_end) for b in blocks]
+
+    free_gaps = compute_section_free_gaps(
+        section_id=sec.id,
+        horizon_start=now,
+        horizon_end=max(now + timedelta(hours=8), required_by + timedelta(hours=2)),
+        train_movements=train_moves,
+        existing_blocks=block_moves,
+        safety_buffer_min=10,
+    )
+
+    for gap in free_gaps:
+        if (gap.duration_min >= estimated_duration_min and 
+            gap.start_dt >= (now + timedelta(minutes=15)) and 
+            (gap.start_dt + timedelta(minutes=estimated_duration_min)) <= required_by):
+            
+            gap_end = gap.start_dt + timedelta(minutes=estimated_duration_min)
+            
+            add_notification(
+                department=source_system,
+                notif_type="GREEN",
+                title=f"FREE GAP IDENTIFIED: {sec.section_code}",
+                message=f"Natural timetable gap found ({gap.start_dt.strftime('%H:%M')} - {gap_end.strftime('%H:%M')}) before deadline ({required_by.strftime('%H:%M')}). Proposed for standard COA review.",
+                section_code=sec.section_code,
+                action_taken="FREE_GAP_PROPOSED",
+            )
+            
+            return {
+                "cascade_step": "free_gap_found",
+                "requires_emergency": False,
+                "message": f"Natural timetable gap available ({gap.start_dt.strftime('%H:%M')} - {gap_end.strftime('%H:%M')}). Block scheduled without emergency escalation.",
+                "proposed_start": gap.start_dt.isoformat(),
+                "proposed_end": gap_end.isoformat(),
+                "duration_min": estimated_duration_min,
+                "deadline": required_by.isoformat(),
+                "incident_id": None,
+                "options": [],
+            }
+
+    # -------------------------------------------------------------
+    # Cascade Step 2: Check Shadow Block Opportunity before required_by
+    # -------------------------------------------------------------
+    candidate_parents = (
+        db.query(Block)
+        .filter(
+            Block.block_section_id == sec.id,
+            Block.status == "active",
+            Block.block_type == "primary",
+            Block.planned_start >= now,
+            Block.planned_start <= required_by,
+        )
+        .order_by(Block.planned_start.asc())
+        .all()
+    )
+
+    for p in candidate_parents:
+        p_dur = int((p.planned_end - p.planned_start).total_seconds() // 60)
+        if p_dur >= estimated_duration_min:
+            shadow_end = p.planned_start + timedelta(minutes=estimated_duration_min)
+            add_notification(
+                department=source_system,
+                notif_type="GREEN",
+                title=f"SHADOW BLOCK OPPORTUNITY: {sec.section_code}",
+                message=f"Can piggyback within primary block #{str(p.id)[:8]} ({p.planned_start.strftime('%H:%M')} - {p.planned_end.strftime('%H:%M')}). 0 min extra delay.",
+                section_code=sec.section_code,
+                action_taken="SHADOW_PROPOSED",
+            )
+            return {
+                "cascade_step": "shadow_block_found",
+                "requires_emergency": False,
+                "message": f"Shadow block piggyback available within Block #{str(p.id)[:8]}. Zero additional delay.",
+                "parent_block_id": str(p.id),
+                "proposed_start": p.planned_start.isoformat(),
+                "proposed_end": shadow_end.isoformat(),
+                "duration_min": estimated_duration_min,
+                "deadline": required_by.isoformat(),
+                "incident_id": None,
+                "options": [],
+            }
+
+    # -------------------------------------------------------------
+    # Cascade Step 3: Neither Gap nor Shadow -> AUTOMATICALLY INVOKE EMERGENCY!
+    # -------------------------------------------------------------
+    incident = create_emergency_incident(
+        db=db,
+        source_system=source_system,
+        block_section_id=sec.id,
+        reported_text=f"CRUCIAL DEFECT: {reason} | Duration: {estimated_duration_min}m | Deadline: {required_by.strftime('%H:%M')}",
+        defect_id=defect_id,
+        defect_type=defect_type,
+        severity="critical",
+        estimated_duration_min=estimated_duration_min,
+        required_by=required_by,
+    )
+
+    options = generate_emergency_block_options(
+        db=db,
+        incident=incident,
+        required_duration_min=estimated_duration_min,
+        reference_time=now,
+    )
+
+    add_notification(
+        department=source_system,
+        notif_type="RED",
+        title=f"🚨 EMERGENCY INVOKED: {sec.section_code}",
+        message=f"No free gap or shadow window available before {required_by.strftime('%H:%M')}. Emergency mode automatically triggered! Siren alert activated at COA.",
+        section_code=sec.section_code,
+        action_taken="EMERGENCY_INVOKED",
+    )
+
+    return {
+        "cascade_step": "emergency_invoked",
+        "requires_emergency": True,
+        "message": f"CRITICAL EMERGENCY: No free gap or shadow block available before {required_by.strftime('%H:%M')}. Emergency mode automatically invoked with active siren alert at COA.",
+        "incident_id": str(incident.id),
+        "section_code": sec.section_code,
+        "deadline": required_by.isoformat(),
+        "options": options,
+    }
+

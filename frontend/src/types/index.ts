@@ -30,6 +30,7 @@ export interface Defect {
   work_category: WorkCategory;
   input_source: InputSource;
   raw_report_text?: string;
+  emergency_cascade?: CrucialCascadeResult;
 }
 
 export interface DefectCreatePayload {
@@ -45,6 +46,33 @@ export interface DefectCreatePayload {
   input_source: InputSource;
   raw_report_text?: string;
   requires_block: boolean;
+  is_crucial_emergency?: boolean;
+}
+
+export interface CrucialCascadeResult {
+  cascade_step: 'free_gap_found' | 'shadow_block_found' | 'emergency_invoked';
+  requires_emergency: boolean;
+  message: string;
+  proposed_start?: string;
+  proposed_end?: string;
+  duration_min?: number;
+  deadline?: string;
+  incident_id?: string;
+  parent_block_id?: string;
+  options?: EmergencyOptionCard[];
+}
+
+export interface ActiveEmergencyAlert {
+  has_active_emergency: boolean;
+  should_sound_siren: boolean;
+  incident: {
+    id: string;
+    source_system: string;
+    section_code: string;
+    reported_text: string;
+    status: string;
+    created_at: string;
+  } | null;
 }
 
 export interface BlockSection {

@@ -21,6 +21,7 @@ from backend.schemas import (
 )
 from backend.reoptimizer.engine import get_all_notifications
 from backend.ml.scorer import score_new_defect
+from backend.emergency.engine import evaluate_crucial_defect_pipeline
 
 router = APIRouter(prefix="/departments", tags=["Departments"])
 
@@ -170,6 +171,22 @@ def create_department_defect(
         db.rollback()
         raise HTTPException(status_code=400, detail=f"Failed to create defect: {str(e)}")
 
+    cascade_res = None
+    if payload.is_crucial_emergency or payload.severity == SeverityLevel.critical:
+        try:
+            cascade_res = evaluate_crucial_defect_pipeline(
+                db=db,
+                source_system=dept.value,
+                block_section_id=defect.block_section_id,
+                reason=defect.description or defect.defect_type,
+                estimated_duration_min=defect.estimated_duration_min,
+                required_by=defect.required_by,
+                defect_id=defect.id,
+                defect_type=defect.defect_type,
+            )
+        except Exception as e:
+            print(f"Error evaluating crucial pipeline: {e}")
+
     return DefectResponseSchema(
         id=defect.id,
         department=dept.value,
@@ -191,6 +208,7 @@ def create_department_defect(
         work_category=defect.work_category,
         input_source=defect.input_source,
         raw_report_text=defect.raw_report_text,
+        emergency_cascade=cascade_res,
     )
 
 

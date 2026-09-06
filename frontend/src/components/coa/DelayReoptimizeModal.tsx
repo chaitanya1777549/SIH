@@ -39,7 +39,7 @@ export const DelayReoptimizeModal: React.FC<DelayReoptimizeModalProps> = ({
     stations.length > 0 ? stations[0].station_code : 'VSKP'
   );
   const [delayMinutes, setDelayMinutes] = useState<number>(45);
-  const [criticalityThreshold, setCriticalityThreshold] = useState<number>(70);
+  const [criticalityThreshold, setCriticalityThreshold] = useState<number>(60);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
   const [simulationResult, setSimulationResult] = useState<ReOptimizeResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -167,7 +167,7 @@ export const DelayReoptimizeModal: React.FC<DelayReoptimizeModalProps> = ({
               className="w-full accent-amber-500"
             />
             <div className="text-[10px] text-slate-400">
-              Blocks with score $\ge {criticalityThreshold}$ preserved (train diverted); otherwise block revoked.
+              Triage flow: Attempts Shadow Block → Free Gap before deadline. If unavailable & score ≥ {criticalityThreshold}, train is diverted/halted and block preserved.
             </div>
           </div>
         </div>

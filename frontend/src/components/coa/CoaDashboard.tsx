@@ -6,6 +6,7 @@ import {
   CorridorBlock,
   ShadowOpportunity,
   EmergencyIncident,
+  ActiveEmergencyAlert,
 } from '../../types';
 import {
   fetchCorridorStations,
@@ -14,8 +15,10 @@ import {
   fetchCorridorBlocks,
   fetchShadowOpportunities,
   fetchEmergencyIncidents,
+  fetchActiveEmergencyAlert,
   API_BASE,
 } from '../../api/client';
+import { startEmergencySiren, stopEmergencySiren } from '../../utils/siren';
 import { CorridorTrackMap } from './CorridorTrackMap';
 import { GanttTimeline } from './GanttTimeline';
 import { TabularView } from './TabularView';
@@ -37,13 +40,34 @@ import {
   Clock,
   Table,
   CheckCircle2,
+  Volume2,
+  VolumeX,
+  ArrowRight,
 } from 'lucide-react';
 
-export const CoaDashboard: React.FC = () => {
+interface CoaDashboardProps {
+  targetIncidentId?: string | null;
+}
+
+export const CoaDashboard: React.FC<CoaDashboardProps> = ({ targetIncidentId }) => {
   // Navigation tab state - default to 'timeline' for authentic Rail Flow
-  const [activeTab, setActiveTab] = useState<'timeline' | 'map' | 'tabular' | 'shadow' | 'emergency'>('timeline');
+  const [activeTab, setActiveTab] = useState<'timeline' | 'map' | 'tabular' | 'shadow' | 'emergency'>(
+    targetIncidentId ? 'emergency' : 'timeline'
+  );
+  const [focusedIncidentId, setFocusedIncidentId] = useState<string | null>(targetIncidentId || null);
   const [selectedDate, setSelectedDate] = useState<string>('2026-09-04');
   const [dateScope, setDateScope] = useState<'day' | 'month'>('day');
+
+  useEffect(() => {
+    if (targetIncidentId) {
+      setFocusedIncidentId(targetIncidentId);
+      setActiveTab('emergency');
+      setTimeout(() => {
+        const el = document.getElementById('emergency-operations-center');
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 100);
+    }
+  }, [targetIncidentId]);
 
   // Corridor Data State
   const [stations, setStations] = useState<Station[]>([]);
@@ -54,6 +78,10 @@ export const CoaDashboard: React.FC = () => {
   const [emergencyCount, setEmergencyCount] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [corridorError, setCorridorError] = useState<string | null>(null);
+
+  // Emergency Alert & Siren State
+  const [activeAlert, setActiveAlert] = useState<ActiveEmergencyAlert | null>(null);
+  const [isSirenMuted, setIsSirenMuted] = useState<boolean>(false);
 
   // Modals
   const [isDelayModalOpen, setIsDelayModalOpen] = useState<boolean>(false);
@@ -69,13 +97,18 @@ export const CoaDashboard: React.FC = () => {
           ? fetchCorridorBlocks(undefined, '2026-09-01', '2026-09-30')
           : fetchCorridorBlocks(selectedDate);
 
-      const [stnData, secData, trnData, blkData, shdData, emgData] = await Promise.all([
+      const [stnData, secData, trnData, blkData, shdData, emgData, alertData] = await Promise.all([
         fetchCorridorStations(),
         getCorridorSections(),
         fetchCorridorTrains(selectedDate),
         blkPromise,
         fetchShadowOpportunities(),
         fetchEmergencyIncidents(),
+        fetchActiveEmergencyAlert().catch(() => ({
+          has_active_emergency: false,
+          should_sound_siren: false,
+          incident: null,
+        })),
       ]);
 
       setStations(stnData);
@@ -84,23 +117,60 @@ export const CoaDashboard: React.FC = () => {
       setBlocks(blkData);
       setShadowOpps(shdData);
       setEmergencyCount(emgData.filter((i: EmergencyIncident) => i.status !== 'released').length);
+      setActiveAlert(alertData);
+
+      // Trigger synthesized dual-tone siren if active emergency is detected and not muted
+      if (alertData.has_active_emergency && alertData.should_sound_siren && !isSirenMuted) {
+        startEmergencySiren();
+      } else {
+        stopEmergencySiren();
+      }
     } catch (err: any) {
       console.error('Failed to load COA corridor data:', err);
       setCorridorError(err?.message || 'Failed to load corridor data from backend');
     } finally {
       setIsLoading(false);
     }
-  }, [selectedDate, dateScope]);
+  }, [selectedDate, dateScope, isSirenMuted]);
+
+  const toggleSirenMute = () => {
+    setIsSirenMuted((prev) => {
+      const next = !prev;
+      if (next) {
+        stopEmergencySiren();
+      } else if (activeAlert?.has_active_emergency && activeAlert?.should_sound_siren) {
+        startEmergencySiren();
+      }
+      return next;
+    });
+  };
+
+  const handleReviewEmergency = (incidentId?: string) => {
+    const idToFocus = incidentId || activeAlert?.incident?.id || null;
+    if (idToFocus) {
+      setFocusedIncidentId(idToFocus);
+    }
+    setActiveTab('emergency');
+    setTimeout(() => {
+      const el = document.getElementById('emergency-operations-center');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  };
 
   useEffect(() => {
     loadCorridorData();
 
-    // 15-second background refresh
+    // 10-second background refresh for responsive emergency detection
     const timer = setInterval(() => {
       loadCorridorData();
-    }, 15000);
+    }, 10000);
 
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      stopEmergencySiren();
+    };
   }, [loadCorridorData]);
 
   // Aggregate Metrics
@@ -111,6 +181,60 @@ export const CoaDashboard: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-5">
+      {/* 🚨 CRITICAL EMERGENCY SIREN ALERT BANNER */}
+      {activeAlert?.has_active_emergency && activeAlert.incident && (
+        <div className="bg-gradient-to-r from-red-950 via-rose-900 to-red-900 border-2 border-rose-500 text-white p-4 sm:p-5 rounded-2xl shadow-2xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4 animate-pulse">
+          <div className="flex items-start sm:items-center gap-3.5">
+            <div className="p-3 bg-red-600 rounded-xl text-white shadow-lg flex-shrink-0 animate-bounce">
+              <AlertOctagon className="w-7 h-7" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="px-2.5 py-0.5 rounded-full text-xs font-black uppercase bg-red-600 text-white shadow-xs border border-red-400 tracking-wider flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-white animate-ping" />
+                  CRITICAL EMERGENCY INVOKED
+                </span>
+                <span className="text-sm font-extrabold text-rose-100">
+                  Section: {activeAlert.incident.section_code} • Department: {activeAlert.incident.source_system}
+                </span>
+                <span className="text-xs text-rose-300 font-mono">
+                  {new Date(activeAlert.incident.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </span>
+              </div>
+              <p className="text-xs font-bold text-white mt-1.5 leading-relaxed">
+                {activeAlert.incident.reported_text}
+              </p>
+              <p className="text-[11px] text-rose-200 mt-1 flex items-center gap-1.5">
+                <span>⚡ Automated Cascade Verdict:</span>
+                <span className="text-rose-300">Free Gap Check (0 slots) ➔ Shadow Piggyback Check (0 slots) ➔ Direct Emergency Mode Escalated to COA</span>
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2.5 flex-shrink-0 w-full md:w-auto justify-end">
+            <button
+              onClick={toggleSirenMute}
+              className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-extrabold transition shadow-md ${
+                isSirenMuted
+                  ? 'bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/50'
+                  : 'bg-rose-800 hover:bg-rose-700 text-white border border-rose-400 animate-pulse'
+              }`}
+            >
+              {isSirenMuted ? <VolumeX className="w-4 h-4 text-amber-400" /> : <Volume2 className="w-4 h-4 text-amber-300 animate-spin" />}
+              <span>{isSirenMuted ? 'Unmute Siren' : 'Mute Siren'}</span>
+            </button>
+
+            <button
+              onClick={() => handleReviewEmergency(activeAlert?.incident?.id)}
+              className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 text-slate-950 font-black rounded-xl text-xs shadow-xl transition active:scale-95 border border-amber-300 cursor-pointer"
+            >
+              <span>Review Tactical Options</span>
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {corridorError && (
         <div className="bg-amber-50 border border-amber-300 text-amber-900 p-4 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
           <div>
@@ -402,10 +526,22 @@ export const CoaDashboard: React.FC = () => {
       )}
 
       {activeTab === 'emergency' && (
-        <EmergencyOperationsCenter
-          sections={sections}
-          onRefreshCorridor={loadCorridorData}
-        />
+        <div id="emergency-operations-center">
+          <EmergencyOperationsCenter
+            sections={sections}
+            targetIncidentId={focusedIncidentId || activeAlert?.incident?.id}
+            onRefreshCorridor={loadCorridorData}
+            onDecisionConfirmed={() => {
+              // 1. Immediately silence and stop siren
+              stopEmergencySiren();
+              setIsSirenMuted(true);
+              // 2. Remove emergency banner from screen
+              setActiveAlert(null);
+              // 3. Refresh corridor data
+              loadCorridorData();
+            }}
+          />
+        </div>
       )}
 
       {/* Modals */}

@@ -266,7 +266,7 @@ def resolve_conflicts_and_reoptimize(
     db: Session,
     service_date: date,
     section_code: Optional[str] = None,
-    criticality_threshold: int = 70,
+    criticality_threshold: int = 60,
     safety_buffer_min: int = 10,
 ) -> ReOptimizeResponseSchema:
     """
@@ -291,22 +291,21 @@ def resolve_conflicts_and_reoptimize(
 
     details: List[ConflictResolutionDetailSchema] = []
     generated_notifications: List[DepartmentNotificationSchema] = []
-
     diverted_count = 0
     revoked_count = 0
     rescheduled_count = 0
 
-    # Keep track of already processed blocks in this pass
-    processed_blocks = set()
-
+    # Group conflicting train schedules by block
+    conflicts_by_block: Dict[UUID, Tuple[Block, List[TrainSchedule]]] = {}
     for sched, block in conflicts:
-        if block.id in processed_blocks:
-            continue
-        processed_blocks.add(block.id)
+        if block.id not in conflicts_by_block:
+            conflicts_by_block[block.id] = (block, [])
+        conflicts_by_block[block.id][1].append(sched)
 
+    for block_id, (block, conflicting_scheds) in conflicts_by_block.items():
         req = block.block_request
         sec = block.block_section
-        train = sched.train
+        primary_train = conflicting_scheds[0].train
 
         defect = req.tms_defect or req.smms_defect or req.tdms_defect
         dept = req.source_system
@@ -314,345 +313,363 @@ def resolve_conflicts_and_reoptimize(
         severity = getattr(defect, "severity", "medium") if defect else "medium"
         crit_score = req.criticality_score
 
-        # Determine criticality classification
-        is_high_criticality = (crit_score >= criticality_threshold) or (severity == "critical")
+        prev_start = block.planned_start
+        prev_end = block.planned_end
+        est_duration = req.estimated_duration_min if req else int((prev_end - prev_start).total_seconds() // 60)
+        req_deadline = req.required_by if req else None
 
-        if is_high_criticality:
-            # === BRANCH 1: HIGH CRITICALITY -> DIVERT TRAIN ===
-            sched.status = "diverted"
-            sched.updated_at = datetime.now(timezone.utc)
-            diverted_count += 1
+        # -------------------------------------------------------------------------
+        # STAGE 1: Check for viable SHADOW BLOCK piggyback before defect deadline
+        # -------------------------------------------------------------------------
+        rescheduled = False
+        rescheduled_info: Optional[Dict[str, Any]] = None
 
-            notif = add_notification(
-                department=dept,
-                notif_type="BLUE",
-                title=f"TRAIN DIVERTED: Train {train.train_number} on {sec.section_code}",
-                message=(
-                    f"Train {train.train_number} DIVERTED on {sec.section_code} due to High-Criticality "
-                    f"safety block ({defect_code}, score: {crit_score}). "
-                    f"Maintenance window {block.planned_start.strftime('%H:%M')} - "
-                    f"{block.planned_end.strftime('%H:%M')} PRESERVED."
-                ),
-                defect_code=defect_code,
-                section_code=sec.section_code,
-                action_taken="TRAIN_DIVERTED",
+        candidate_parents = (
+            db.query(Block)
+            .filter(
+                Block.block_section_id == sec.id,
+                Block.status == "active",
+                Block.block_type == "primary",
+                Block.id != block.id,
+                Block.planned_start >= block.planned_start,
             )
-            generated_notifications.append(DepartmentNotificationSchema(**notif))
+            .order_by(Block.planned_start.asc())
+            .all()
+        )
 
-            details.append(
-                ConflictResolutionDetailSchema(
-                    conflict_type="train_vs_block",
-                    section_code=sec.section_code,
-                    train_number=train.train_number,
-                    train_forecast_entry=sched.forecast_entry,
-                    train_forecast_exit=sched.forecast_exit,
-                    block_id=block.id,
-                    block_planned_start=block.planned_start,
-                    block_planned_end=block.planned_end,
-                    defect_code=defect_code,
-                    defect_department=dept,
-                    criticality_score=crit_score,
-                    severity=severity,
-                    decision="train_diverted",
-                    rescheduled_slot=None,
-                    notes=(
-                        f"Safety Critical Block (Score {crit_score}, Severity '{severity}'). "
-                        f"Block preserved; Train {train.train_number} diverted via alternate routing."
-                    ),
+        for parent in candidate_parents:
+            parent_duration = int((parent.planned_end - parent.planned_start).total_seconds() // 60)
+            if parent_duration >= est_duration:
+                # Must complete before defect deadline
+                if req_deadline and parent.planned_end > req_deadline:
+                    continue
+
+                # Viable shadow block found before deadline!
+                # Cancel original block slot so the delayed train can pass
+                block.status = "cancelled"
+                db.flush()
+
+                shadow_end = parent.planned_start + timedelta(minutes=est_duration)
+                new_shadow = Block(
+                    block_request_id=req.id if req else None,
+                    block_section_id=sec.id,
+                    planned_start=parent.planned_start,
+                    planned_end=shadow_end,
+                    status="active",
+                    block_type="shadow",
+                    parent_block_id=parent.id,
                 )
+                db.add(new_shadow)
+                db.flush()
+
+                shadow_hist = BlockAllocationHistory(
+                    block_id=new_shadow.id,
+                    block_request_id=req.id if req else None,
+                    block_section_id=sec.id,
+                    previous_start=prev_start,
+                    previous_end=prev_end,
+                    new_start=new_shadow.planned_start,
+                    new_end=new_shadow.planned_end,
+                    reason="shadow_block_attached_due_to_train_delay",
+                )
+                db.add(shadow_hist)
+
+                if req:
+                    req.status = "allocated"
+                if defect:
+                    defect.status = "allocated"
+
+                rescheduled_count += 1
+                rescheduled = True
+                rescheduled_info = {
+                    "type": "shadow",
+                    "block_id": str(new_shadow.id),
+                    "parent_block_id": str(parent.id),
+                    "planned_start": new_shadow.planned_start.isoformat(),
+                    "planned_end": new_shadow.planned_end.isoformat(),
+                }
+
+                notif_green = add_notification(
+                    department=dept,
+                    notif_type="GREEN",
+                    title=f"RESCHEDULED AS SHADOW BLOCK: {defect_code}",
+                    message=(
+                        f"Delayed trains detected into block window on {sec.section_code}. "
+                        f"Defect {defect_code} successfully piggybacked as Shadow Block "
+                        f"({new_shadow.planned_start.strftime('%H:%M')} - {new_shadow.planned_end.strftime('%H:%M')}) "
+                        f"before deadline {req_deadline.strftime('%H:%M') if req_deadline else 'N/A'}. "
+                        f"Original track slot released for trains."
+                    ),
+                    defect_code=defect_code,
+                    section_code=sec.section_code,
+                    action_taken="SHADOW_RESCHEDULED",
+                )
+                generated_notifications.append(DepartmentNotificationSchema(**notif_green))
+
+                for sched in conflicting_scheds:
+                    details.append(
+                        ConflictResolutionDetailSchema(
+                            conflict_type="train_vs_block",
+                            section_code=sec.section_code,
+                            train_number=sched.train.train_number,
+                            train_forecast_entry=sched.forecast_entry,
+                            train_forecast_exit=sched.forecast_exit,
+                            block_id=block.id,
+                            block_planned_start=prev_start,
+                            block_planned_end=prev_end,
+                            defect_code=defect_code,
+                            defect_department=dept,
+                            criticality_score=crit_score,
+                            severity=severity,
+                            decision="block_rescheduled_shadow",
+                            rescheduled_slot=rescheduled_info,
+                            notes=(
+                                f"Train {sched.train.train_number} delayed into block window. Defect {defect_code} "
+                                f"reallocated as shadow block before deadline; original track cleared for train."
+                            ),
+                        )
+                    )
+                break
+
+        # -------------------------------------------------------------------------
+        # STAGE 2: If no shadow block, check for viable FREE GAP before defect deadline
+        # -------------------------------------------------------------------------
+        if not rescheduled:
+            horizon_start = datetime.combine(service_date, time.min).replace(tzinfo=timezone.utc)
+            horizon_end = horizon_start + timedelta(days=3)
+
+            train_rows = (
+                db.query(TrainSchedule)
+                .filter(
+                    TrainSchedule.block_section_id == sec.id,
+                    TrainSchedule.service_date >= service_date,
+                    TrainSchedule.service_date <= (service_date + timedelta(days=3)),
+                    TrainSchedule.status.in_(["scheduled", "running"]),
+                )
+                .all()
             )
+            train_moves = [(t.forecast_entry, t.forecast_exit) for t in train_rows]
 
-        else:
-            # === BRANCH 2: NORMAL/LOW CRITICALITY -> REVOKE BLOCK & RESCHEDULE ===
-            revoked_count += 1
-            prev_start = block.planned_start
-            prev_end = block.planned_end
-
-            # Revoke current block
-            block.status = "cancelled"
-            db.flush()
-
-            # Record revocation in audit history
-            revoke_hist = BlockAllocationHistory(
-                block_id=block.id,
-                block_request_id=req.id,
-                block_section_id=sec.id,
-                previous_start=prev_start,
-                previous_end=prev_end,
-                new_start=None,
-                new_end=None,
-                reason="reoptimized_due_to_delay",
-            )
-            db.add(revoke_hist)
-            db.flush()
-
-            # Send immediate RED notification to department
-            notif_red = add_notification(
-                department=dept,
-                notif_type="RED",
-                title=f"BLOCK REVOKED: {defect_code} on {sec.section_code}",
-                message=(
-                    f"Routine maintenance block ({defect_code}, score: {crit_score}) on {sec.section_code} "
-                    f"was REVOKED due to delay of Train {train.train_number}. System seeking immediate rescheduling."
-                ),
-                defect_code=defect_code,
-                section_code=sec.section_code,
-                action_taken="BLOCK_REVOKED",
-            )
-            generated_notifications.append(DepartmentNotificationSchema(**notif_red))
-
-            # Attempt immediate rescheduling
-            rescheduled = False
-            rescheduled_info: Optional[Dict[str, Any]] = None
-
-            # --- Attempt A: Immediate Shadow Block Piggyback ---
-            candidate_parents = (
+            other_blocks = (
                 db.query(Block)
                 .filter(
                     Block.block_section_id == sec.id,
                     Block.status == "active",
-                    Block.block_type == "primary",
                     Block.id != block.id,
                 )
-                .order_by(Block.planned_start.asc())
                 .all()
             )
+            block_moves = [(b.planned_start, b.planned_end) for b in other_blocks]
 
-            for parent in candidate_parents:
-                parent_duration = int((parent.planned_end - parent.planned_start).total_seconds() // 60)
-                if parent_duration >= req.estimated_duration_min:
-                    # Check deadline
-                    if req.required_by and parent.planned_end > req.required_by:
+            free_gaps = compute_section_free_gaps(
+                section_id=sec.id,
+                horizon_start=horizon_start,
+                horizon_end=horizon_end,
+                train_movements=train_moves,
+                existing_blocks=block_moves,
+                safety_buffer_min=safety_buffer_min,
+            )
+
+            for gap in free_gaps:
+                if gap.end_dt <= prev_end:
+                    continue
+
+                if gap.duration_min >= est_duration:
+                    slot_start = gap.start_dt
+                    slot_end = slot_start + timedelta(minutes=est_duration)
+
+                    # Must complete before defect deadline
+                    if req_deadline and slot_end > req_deadline:
                         continue
 
-                    # Viable shadow block found!
-                    shadow_end = parent.planned_start + timedelta(minutes=req.estimated_duration_min)
-                    new_shadow = Block(
-                        block_request_id=req.id,
-                        block_section_id=sec.id,
-                        planned_start=parent.planned_start,
-                        planned_end=shadow_end,
-                        status="active",
-                        block_type="shadow",
-                        parent_block_id=parent.id,
-                    )
-                    db.add(new_shadow)
+                    # Viable free gap found before deadline!
+                    block.status = "cancelled"
                     db.flush()
 
-                    shadow_hist = BlockAllocationHistory(
-                        block_id=new_shadow.id,
-                        block_request_id=req.id,
+                    new_primary = Block(
+                        block_request_id=req.id if req else None,
+                        block_section_id=sec.id,
+                        planned_start=slot_start,
+                        planned_end=slot_end,
+                        status="active",
+                        block_type="primary",
+                    )
+                    db.add(new_primary)
+                    db.flush()
+
+                    gap_hist = BlockAllocationHistory(
+                        block_id=new_primary.id,
+                        block_request_id=req.id if req else None,
                         block_section_id=sec.id,
                         previous_start=prev_start,
                         previous_end=prev_end,
-                        new_start=new_shadow.planned_start,
-                        new_end=new_shadow.planned_end,
-                        reason="shadow_block_attached",
+                        new_start=new_primary.planned_start,
+                        new_end=new_primary.planned_end,
+                        reason="free_gap_reallocated_due_to_train_delay",
                     )
-                    db.add(shadow_hist)
+                    db.add(gap_hist)
 
-                    # Update status
-                    req.status = "allocated"
+                    if req:
+                        req.status = "allocated"
                     if defect:
                         defect.status = "allocated"
 
                     rescheduled_count += 1
                     rescheduled = True
                     rescheduled_info = {
-                        "type": "shadow",
-                        "block_id": str(new_shadow.id),
-                        "parent_block_id": str(parent.id),
-                        "planned_start": new_shadow.planned_start.isoformat(),
-                        "planned_end": new_shadow.planned_end.isoformat(),
+                        "type": "gap",
+                        "block_id": str(new_primary.id),
+                        "planned_start": new_primary.planned_start.isoformat(),
+                        "planned_end": new_primary.planned_end.isoformat(),
                     }
 
                     notif_green = add_notification(
                         department=dept,
                         notif_type="GREEN",
-                        title=f"RESCHEDULED AS SHADOW BLOCK: {defect_code}",
+                        title=f"RESCHEDULED TO NEW GAP: {defect_code}",
                         message=(
-                            f"Defect {defect_code} successfully rescheduled as Shadow Block on {sec.section_code} "
-                            f"({new_shadow.planned_start.strftime('%H:%M')} - {new_shadow.planned_end.strftime('%H:%M')}) "
-                            f"piggybacking on primary block {str(parent.id)[:8]}."
+                            f"Delayed trains detected into block window on {sec.section_code}. "
+                            f"Defect {defect_code} successfully rescheduled into next free gap "
+                            f"({new_primary.planned_start.strftime('%Y-%m-%d %H:%M')} - {new_primary.planned_end.strftime('%H:%M')}) "
+                            f"before deadline {req_deadline.strftime('%H:%M') if req_deadline else 'N/A'}. "
+                            f"Original slot released for trains."
                         ),
                         defect_code=defect_code,
                         section_code=sec.section_code,
-                        action_taken="SHADOW_RESCHEDULED",
+                        action_taken="GAP_RESCHEDULED",
                     )
                     generated_notifications.append(DepartmentNotificationSchema(**notif_green))
+
+                    for sched in conflicting_scheds:
+                        details.append(
+                            ConflictResolutionDetailSchema(
+                                conflict_type="train_vs_block",
+                                section_code=sec.section_code,
+                                train_number=sched.train.train_number,
+                                train_forecast_entry=sched.forecast_entry,
+                                train_forecast_exit=sched.forecast_exit,
+                                block_id=block.id,
+                                block_planned_start=prev_start,
+                                block_planned_end=prev_end,
+                                defect_code=defect_code,
+                                defect_department=dept,
+                                criticality_score=crit_score,
+                                severity=severity,
+                                decision="block_rescheduled_gap",
+                                rescheduled_slot=rescheduled_info,
+                                notes=(
+                                    f"Train {sched.train.train_number} delayed into block window. Defect {defect_code} "
+                                    f"reallocated to available free gap before deadline; original track cleared for train."
+                                ),
+                            )
+                        )
                     break
 
-            # --- Attempt B: Next Available Free Gap ---
-            if not rescheduled:
-                horizon_start = datetime.combine(service_date, time.min).replace(tzinfo=timezone.utc)
-                horizon_end = horizon_start + timedelta(days=3)  # Look up to 72 hours ahead
+        # -------------------------------------------------------------------------
+        # STAGE 3: Neither shadow block nor free gap possible before deadline:
+        # Check criticality threshold (> 60)
+        # -------------------------------------------------------------------------
+        if not rescheduled:
+            if crit_score >= criticality_threshold or severity in ("critical", "high"):
+                # Criticality > 60: Defect cannot be moved without safety violation.
+                # PRESERVE BLOCK. Notify COA with urgent directive to DIVERT or HALT every conflicting train!
+                for sched in conflicting_scheds:
+                    sched.status = "diverted"
+                    sched.updated_at = datetime.now(timezone.utc)
+                    diverted_count += 1
+                    t = sched.train
 
-                # Fetch train occupancies on this section
-                train_rows = (
-                    db.query(TrainSchedule)
-                    .filter(
-                        TrainSchedule.block_section_id == sec.id,
-                        TrainSchedule.service_date >= service_date,
-                        TrainSchedule.service_date <= (service_date + timedelta(days=3)),
-                        TrainSchedule.status.in_(["scheduled", "running"]),
+                    notif_urgent = add_notification(
+                        department="COA",
+                        notif_type="BLUE",
+                        title=f"URGENT DIRECTIVE: DIVERT OR HALT TRAIN {t.train_number} on {sec.section_code}",
+                        message=(
+                            f"CRITICAL DEFECT DIRECTIVE: Train {t.train_number} delayed into active safety block "
+                            f"({block.planned_start.strftime('%H:%M')} - {block.planned_end.strftime('%H:%M')}) on {sec.section_code}. "
+                            f"Defect {defect_code} is CRITICAL (Score: {crit_score} >= {criticality_threshold}, Severity: '{severity}') "
+                            f"with NO alternative shadow block or free gap available before safety deadline "
+                            f"({req_deadline.strftime('%H:%M') if req_deadline else 'immediate'}). "
+                            f"Block PRESERVED. COA DIRECTIVE: DIVERT Train {t.train_number} via adjacent track or "
+                            f"HALT at upstream station loop line."
+                        ),
+                        defect_code=defect_code,
+                        section_code=sec.section_code,
+                        action_taken="TRAIN_DIVERT_OR_HALT_DIRECTIVE",
                     )
-                    .all()
-                )
-                train_moves = [(t.forecast_entry, t.forecast_exit) for t in train_rows]
+                    generated_notifications.append(DepartmentNotificationSchema(**notif_urgent))
 
-                # Fetch other active blocks on this section
-                other_blocks = (
-                    db.query(Block)
-                    .filter(
-                        Block.block_section_id == sec.id,
-                        Block.status == "active",
-                        Block.id != block.id,
-                    )
-                    .all()
-                )
-                block_moves = [(b.planned_start, b.planned_end) for b in other_blocks]
-
-                free_gaps = compute_section_free_gaps(
-                    section_id=sec.id,
-                    horizon_start=horizon_start,
-                    horizon_end=horizon_end,
-                    train_movements=train_moves,
-                    existing_blocks=block_moves,
-                    safety_buffer_min=safety_buffer_min,
-                )
-
-                # Find earliest viable gap
-                for gap in free_gaps:
-                    # Skip gaps that end before the original block was supposed to end
-                    if gap.end_dt <= prev_end:
-                        continue
-
-                    if gap.duration_min >= req.estimated_duration_min:
-                        slot_start = gap.start_dt
-                        slot_end = slot_start + timedelta(minutes=req.estimated_duration_min)
-
-                        # Check deadline
-                        if req.required_by and slot_end > req.required_by:
-                            continue
-
-                        # Gap is viable!
-                        new_primary = Block(
-                            block_request_id=req.id,
-                            block_section_id=sec.id,
-                            planned_start=slot_start,
-                            planned_end=slot_end,
-                            status="active",
-                            block_type="primary",
-                        )
-                        db.add(new_primary)
-                        db.flush()
-
-                        gap_hist = BlockAllocationHistory(
-                            block_id=new_primary.id,
-                            block_request_id=req.id,
-                            block_section_id=sec.id,
-                            previous_start=prev_start,
-                            previous_end=prev_end,
-                            new_start=new_primary.planned_start,
-                            new_end=new_primary.planned_end,
-                            reason="reoptimized_due_to_delay",
-                        )
-                        db.add(gap_hist)
-
-                        req.status = "allocated"
-                        if defect:
-                            defect.status = "allocated"
-
-                        rescheduled_count += 1
-                        rescheduled = True
-                        rescheduled_info = {
-                            "type": "gap",
-                            "block_id": str(new_primary.id),
-                            "planned_start": new_primary.planned_start.isoformat(),
-                            "planned_end": new_primary.planned_end.isoformat(),
-                        }
-
-                        notif_green = add_notification(
-                            department=dept,
-                            notif_type="GREEN",
-                            title=f"RESCHEDULED TO NEW GAP: {defect_code}",
-                            message=(
-                                f"Defect {defect_code} successfully rescheduled into next free gap on {sec.section_code} "
-                                f"({new_primary.planned_start.strftime('%Y-%m-%d %H:%M')} - "
-                                f"{new_primary.planned_end.strftime('%H:%M')})."
-                            ),
-                            defect_code=defect_code,
+                    details.append(
+                        ConflictResolutionDetailSchema(
+                            conflict_type="train_vs_block",
                             section_code=sec.section_code,
-                            action_taken="GAP_RESCHEDULED",
+                            train_number=t.train_number,
+                            train_forecast_entry=sched.forecast_entry,
+                            train_forecast_exit=sched.forecast_exit,
+                            block_id=block.id,
+                            block_planned_start=block.planned_start,
+                            block_planned_end=block.planned_end,
+                            defect_code=defect_code,
+                            defect_department=dept,
+                            criticality_score=crit_score,
+                            severity=severity,
+                            decision="train_divert_or_halt",
+                            rescheduled_slot=None,
+                            notes=(
+                                f"Safety Critical Block (Score {crit_score} >= {criticality_threshold}). Neither shadow block nor gap available "
+                                f"before deadline. Block preserved; COA notified to DIVERT or HALT Train {t.train_number}."
+                            ),
                         )
-                        generated_notifications.append(DepartmentNotificationSchema(**notif_green))
-                        break
+                    )
+            else:
+                # Criticality <= 60 (Routine/Low): Revoke routine block & defer to pending review
+                revoked_count += 1
+                block.status = "cancelled"
+                db.flush()
 
-            # --- Case C: Defer to Pending ---
-            if not rescheduled:
-                req.status = "pending"
+                if req:
+                    req.status = "pending"
                 if defect:
                     defect.status = "open"
 
-                notif_amber = add_notification(
-                    department=dept,
-                    notif_type="AMBER",
-                    title=f"RESCHEDULING DEFERRED: {defect_code}",
-                    message=(
-                        f"No viable shadow or free gap found on {sec.section_code} before deadline "
-                        f"{req.required_by}. Request deferred to pending for controller review."
-                    ),
-                    defect_code=defect_code,
-                    section_code=sec.section_code,
-                    action_taken="DEFERRED_TO_PENDING",
-                )
-                generated_notifications.append(DepartmentNotificationSchema(**notif_amber))
+                for sched in conflicting_scheds:
+                    t = sched.train
+                    notif_amber = add_notification(
+                        department=dept,
+                        notif_type="AMBER",
+                        title=f"ROUTINE BLOCK REVOKED: {defect_code}",
+                        message=(
+                            f"Routine block ({defect_code}, score: {crit_score} <= {criticality_threshold}) on {sec.section_code} "
+                            f"was REVOKED due to delay of Train {t.train_number}. "
+                            f"No alternative shadow or gap slot before deadline; deferred to pending."
+                        ),
+                        defect_code=defect_code,
+                        section_code=sec.section_code,
+                        action_taken="DEFERRED_TO_PENDING",
+                    )
+                    generated_notifications.append(DepartmentNotificationSchema(**notif_amber))
 
-                details.append(
-                    ConflictResolutionDetailSchema(
-                        conflict_type="train_vs_block",
-                        section_code=sec.section_code,
-                        train_number=train.train_number,
-                        train_forecast_entry=sched.forecast_entry,
-                        train_forecast_exit=sched.forecast_exit,
-                        block_id=block.id,
-                        block_planned_start=prev_start,
-                        block_planned_end=prev_end,
-                        defect_code=defect_code,
-                        defect_department=dept,
-                        criticality_score=crit_score,
-                        severity=severity,
-                        decision="block_revoked_and_deferred",
-                        rescheduled_slot=None,
-                        notes=(
-                            f"Block revoked due to Train {train.train_number} delay. "
-                            f"No slot before deadline {req.required_by}. Deferred to pending."
-                        ),
+                    details.append(
+                        ConflictResolutionDetailSchema(
+                            conflict_type="train_vs_block",
+                            section_code=sec.section_code,
+                            train_number=t.train_number,
+                            train_forecast_entry=sched.forecast_entry,
+                            train_forecast_exit=sched.forecast_exit,
+                            block_id=block.id,
+                            block_planned_start=prev_start,
+                            block_planned_end=prev_end,
+                            defect_code=defect_code,
+                            defect_department=dept,
+                            criticality_score=crit_score,
+                            severity=severity,
+                            decision="block_revoked_and_deferred",
+                            rescheduled_slot=None,
+                            notes=(
+                                f"Routine defect (Score {crit_score} <= {criticality_threshold}). No alternative shadow or gap found before "
+                                f"deadline; block revoked and deferred to pending review to allow delayed Train {t.train_number} to proceed."
+                            ),
+                        )
                     )
-                )
-            else:
-                details.append(
-                    ConflictResolutionDetailSchema(
-                        conflict_type="train_vs_block",
-                        section_code=sec.section_code,
-                        train_number=train.train_number,
-                        train_forecast_entry=sched.forecast_entry,
-                        train_forecast_exit=sched.forecast_exit,
-                        block_id=block.id,
-                        block_planned_start=prev_start,
-                        block_planned_end=prev_end,
-                        defect_code=defect_code,
-                        defect_department=dept,
-                        criticality_score=crit_score,
-                        severity=severity,
-                        decision="block_revoked_and_rescheduled",
-                        rescheduled_slot=rescheduled_info,
-                        notes=(
-                            f"Block revoked due to Train {train.train_number} delay. "
-                            f"Successfully rescheduled as {rescheduled_info['type'].upper()} block."
-                        ),
-                    )
-                )
 
     db.commit()
 
@@ -674,7 +691,7 @@ def delay_and_reoptimize(
     service_date: date,
     station_code: str,
     delay_minutes: int,
-    criticality_threshold: int = 70,
+    criticality_threshold: int = 60,
 ) -> Dict[str, Any]:
     """
     Unified one-click controller workflow:

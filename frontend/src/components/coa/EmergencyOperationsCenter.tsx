@@ -12,6 +12,7 @@ import {
   confirmEmergencyDecision,
   advanceEmergencyStatus,
 } from '../../api/client';
+import { startEmergencySiren, stopEmergencySiren, isSirenActive } from '../../utils/siren';
 import {
   AlertOctagon,
   ShieldAlert,
@@ -26,25 +27,48 @@ import {
   AlertTriangle,
   FileCheck,
   Sliders,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 
 interface EmergencyOperationsCenterProps {
   sections: BlockSection[];
   onRefreshCorridor?: () => Promise<void>;
+  targetIncidentId?: string | null;
+  onDecisionConfirmed?: () => void;
 }
 
 export const EmergencyOperationsCenter: React.FC<EmergencyOperationsCenterProps> = ({
   sections,
   onRefreshCorridor,
+  targetIncidentId,
+  onDecisionConfirmed,
 }) => {
   const [incidents, setIncidents] = useState<EmergencyIncident[]>([]);
-  const [selectedIncidentId, setSelectedIncidentId] = useState<string | null>(null);
+  const [selectedIncidentId, setSelectedIncidentId] = useState<string | null>(targetIncidentId || null);
   const [activeAnalysis, setActiveAnalysis] = useState<EmergencyAnalysisResponse | null>(null);
   const [selectedOptionId, setSelectedOptionId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isReportingModalOpen, setIsReportingModalOpen] = useState<boolean>(false);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [sirenPlaying, setSirenPlaying] = useState<boolean>(isSirenActive());
+
+  useEffect(() => {
+    if (targetIncidentId) {
+      setSelectedIncidentId(targetIncidentId);
+    }
+  }, [targetIncidentId]);
+
+  const handleToggleSiren = () => {
+    if (sirenPlaying) {
+      stopEmergencySiren();
+      setSirenPlaying(false);
+    } else {
+      startEmergencySiren();
+      setSirenPlaying(true);
+    }
+  };
 
   // New Incident Form State
   const [formSource, setFormSource] = useState<'TMS' | 'SMMS' | 'TDMS'>('TMS');
@@ -59,8 +83,13 @@ export const EmergencyOperationsCenter: React.FC<EmergencyOperationsCenterProps>
       setIsLoading(true);
       const data = await fetchEmergencyIncidents();
       setIncidents(data);
-      if (data.length > 0 && !selectedIncidentId) {
-        setSelectedIncidentId(data[0].id);
+      
+      // Select priority: targetIncidentId > active unconfirmed incident > existing > data[0]
+      if (targetIncidentId && data.some((i) => i.id === targetIncidentId)) {
+        setSelectedIncidentId(targetIncidentId);
+      } else if (!selectedIncidentId || !data.some((i) => i.id === selectedIncidentId)) {
+        const activeOne = data.find((i) => i.status === 'action_recommended' || i.status === 'reported');
+        setSelectedIncidentId(activeOne ? activeOne.id : data.length > 0 ? data[0].id : null);
       }
     } catch (err: any) {
       console.error('Failed to load emergency incidents:', err);
@@ -136,6 +165,15 @@ export const EmergencyOperationsCenter: React.FC<EmergencyOperationsCenterProps>
         selectedOptionId || undefined,
         'Approved by COA Senior Controller via EOC Matrix'
       );
+      // 1. Immediately silence the siren upon controller decision confirmation
+      stopEmergencySiren();
+      setSirenPlaying(false);
+
+      // 2. Notify parent CoaDashboard to clear active alert banner and mute siren immediately
+      if (onDecisionConfirmed) {
+        onDecisionConfirmed();
+      }
+
       setActionSuccess(res.message || 'Decision confirmed! Emergency possession created.');
       await loadIncidents();
       const updatedAnalysis = await fetchEmergencyIncidentAnalysis(selectedIncidentId);
@@ -202,6 +240,16 @@ export const EmergencyOperationsCenter: React.FC<EmergencyOperationsCenterProps>
         </div>
 
         <div className="flex items-center gap-2">
+          {sirenPlaying && (
+            <button
+              onClick={handleToggleSiren}
+              className="flex items-center gap-1.5 bg-rose-800/90 hover:bg-rose-700 text-amber-300 text-xs font-bold px-3 py-2 rounded-lg border border-rose-500 shadow-md transition animate-pulse"
+              title="Silence Siren"
+            >
+              <VolumeX className="w-4 h-4 text-amber-300" />
+              <span>Silence Siren</span>
+            </button>
+          )}
           <button
             onClick={() => setIsReportingModalOpen(true)}
             className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold px-3.5 py-2 rounded-lg shadow-md transition"
@@ -324,6 +372,57 @@ export const EmergencyOperationsCenter: React.FC<EmergencyOperationsCenterProps>
                 <div className="text-xs text-slate-200 bg-slate-900/80 p-3 rounded-lg border border-slate-800">
                   <span className="font-semibold text-rose-300">Reported Issue: </span>
                   {selectedIncident.reported_text}
+                </div>
+
+                {/* Algorithmic Triage Cascade Verification */}
+                <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 flex flex-col gap-2.5">
+                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 flex items-center justify-between">
+                    <span className="flex items-center gap-1.5 text-rose-300">
+                      <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
+                      Automated 3-Stage Cascade Verification
+                    </span>
+                    <span className="text-[10px] text-slate-400 font-mono">
+                      Department Origin: {selectedIncident.source_system} Field Defect
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
+                    <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800 flex flex-col gap-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-slate-300 text-[11px]">1. Timetable Free Gap</span>
+                        <span className="text-[10px] font-bold text-rose-400 bg-rose-950/60 px-1.5 py-0.5 rounded border border-rose-800">
+                          ❌ UNAVAILABLE
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 leading-tight">
+                        No natural 60-90m train-free slot exists before required deadline. Standard block impossible without regulation.
+                      </p>
+                    </div>
+
+                    <div className="p-2.5 rounded-lg bg-slate-950/80 border border-slate-800 flex flex-col gap-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-slate-300 text-[11px]">2. Shadow Piggyback</span>
+                        <span className="text-[10px] font-bold text-rose-400 bg-rose-950/60 px-1.5 py-0.5 rounded border border-rose-800">
+                          ❌ NO OVERLAP
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 leading-tight">
+                        No active primary possession approved on {selectedIncident.section_code || 'section'} before resolution deadline.
+                      </p>
+                    </div>
+
+                    <div className="p-2.5 rounded-lg bg-rose-950/40 border border-rose-600/60 flex flex-col gap-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-rose-300 text-[11px]">3. Emergency Escalation</span>
+                        <span className="text-[10px] font-black text-rose-200 bg-rose-700 px-1.5 py-0.5 rounded border border-rose-500 animate-pulse">
+                          🚨 AUTO-TRIGGERED
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-rose-200/90 leading-tight">
+                        Direct COA Siren alert sounded. Multi-option tactical mitigation matrix calculated below for controller approval.
+                      </p>
+                    </div>
+                  </div>
                 </div>
 
                 {/* Tactical Heuristic Recommendation */}

@@ -14,6 +14,8 @@ import {
   EmergencyAnalysisResponse,
   OptimizerResult,
   ReOptimizeResult,
+  CrucialCascadeResult,
+  ActiveEmergencyAlert,
 } from '../types';
 
 const DEFAULT_PROD_API = 'https://sih26027-backend-zlbr.onrender.com';
@@ -315,7 +317,7 @@ export async function simulateDelayAndReoptimize(
   serviceDate: string,
   stationCode: string,
   delayMinutes: number,
-  criticalityThreshold: number = 70
+  criticalityThreshold: number = 60
 ): Promise<ReOptimizeResult> {
   const res = await fetch(`${API_BASE}/coa/trains/delay-and-reoptimize`, {
     method: 'POST',
@@ -409,5 +411,35 @@ export async function advanceEmergencyStatus(
   }
   return await res.json();
 }
+
+export async function evaluateCrucialDefect(payload: {
+  source_system: string;
+  block_section_id: string;
+  reason: string;
+  estimated_duration_min: number;
+  required_by_minutes?: number;
+  defect_type?: string;
+  defect_id?: string;
+}): Promise<CrucialCascadeResult> {
+  const res = await fetch(`${API_BASE}/coa/emergency/evaluate-crucial`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(formatErrorMessage(err, 'Failed to evaluate crucial defect cascade'));
+  }
+  return await res.json();
+}
+
+export async function fetchActiveEmergencyAlert(): Promise<ActiveEmergencyAlert> {
+  const res = await fetch(`${API_BASE}/coa/emergency/active-alert`);
+  if (!res.ok) {
+    throw new Error('Failed to load active emergency alert');
+  }
+  return await res.json();
+}
+
 
 
