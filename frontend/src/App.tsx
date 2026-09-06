@@ -5,6 +5,7 @@ import {
   getDepartmentNotifications,
   getCorridorSections,
   checkBackendHealth,
+  API_BASE,
 } from './api/client';
 import { Header } from './components/Header';
 import { NotificationStream } from './components/NotificationStream';
@@ -22,6 +23,7 @@ export const App: React.FC = () => {
   const [notifications, setNotifications] = useState<DepartmentNotification[]>([]);
   const [isOnline, setIsOnline] = useState<boolean>(true);
   const [loading, setLoading] = useState<boolean>(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [isVoiceModalOpen, setIsVoiceModalOpen] = useState<boolean>(false);
   const [isManualModalOpen, setIsManualModalOpen] = useState<boolean>(false);
 
@@ -35,6 +37,7 @@ export const App: React.FC = () => {
   // 2. Load defects & notifications for selected department
   const loadData = useCallback(async (showLoading = true) => {
     if (showLoading) setLoading(true);
+    setFetchError(null);
     try {
       const [defectList, notifList, health] = await Promise.all([
         getDepartmentDefects(department),
@@ -45,8 +48,9 @@ export const App: React.FC = () => {
       setDefects(defectList);
       setNotifications(notifList);
       setIsOnline(health.status === 'healthy' || health.status === 'online');
-    } catch (err) {
+    } catch (err: any) {
       console.error('Data loading error:', err);
+      setFetchError(err?.message || String(err));
       setIsOnline(false);
     } finally {
       if (showLoading) setLoading(false);
@@ -122,6 +126,27 @@ export const App: React.FC = () => {
 
       {/* Content Area */}
       <main className="flex-1 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6 w-full">
+        {!isOnline && (
+          <div className="bg-rose-50 border border-rose-200 text-rose-800 p-4 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-center gap-3">
+              <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse"></span>
+              <div>
+                <p className="font-bold text-xs">Backend Connection Waiting / Inactive</p>
+                <p className="text-[11px] text-rose-600 mt-0.5">
+                  Target API: <code className="font-mono bg-white px-1.5 py-0.5 rounded border border-rose-200">{API_BASE || window.location.origin}</code>
+                  {fetchError ? ` • Details: ${fetchError}` : ''}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => loadData(true)}
+              className="px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition shadow-xs flex-shrink-0"
+            >
+              Retry Connection
+            </button>
+          </div>
+        )}
+
         {activeView === 'COA' ? (
           /* COA MASTER INTERFACE */
           <CoaDashboard />

@@ -1,5 +1,6 @@
 import React from 'react';
-import { Department, ActiveView } from '../types';
+import { ActiveView } from '../types';
+import { API_BASE } from '../api/client';
 import { Mic, PlusCircle, Train, Zap, Radio, ShieldAlert, Layers, Database } from 'lucide-react';
 
 interface HeaderProps {
@@ -66,6 +67,7 @@ export const Header: React.FC<HeaderProps> = ({
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                       : 'bg-rose-50 text-rose-700 border-rose-200'
                   }`}
+                  title={`API Target: ${API_BASE || 'Local Vite Proxy'}`}
                 >
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${
@@ -73,6 +75,9 @@ export const Header: React.FC<HeaderProps> = ({
                     }`}
                   ></span>
                   {isOnline ? 'Live Connected' : 'Offline'}
+                </span>
+                <span className="text-[10px] text-slate-400 font-mono hidden lg:inline">
+                  • {API_BASE ? 'Render Cloud' : 'Local'}
                 </span>
               </div>
               <p className="text-xs text-slate-500 font-medium">

@@ -14,6 +14,7 @@ import {
   fetchCorridorBlocks,
   fetchShadowOpportunities,
   fetchEmergencyIncidents,
+  API_BASE,
 } from '../../api/client';
 import { CorridorTrackMap } from './CorridorTrackMap';
 import { GanttTimeline } from './GanttTimeline';
@@ -52,6 +53,7 @@ export const CoaDashboard: React.FC = () => {
   const [shadowOpps, setShadowOpps] = useState<ShadowOpportunity[]>([]);
   const [emergencyCount, setEmergencyCount] = useState<number>(0);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [corridorError, setCorridorError] = useState<string | null>(null);
 
   // Modals
   const [isDelayModalOpen, setIsDelayModalOpen] = useState<boolean>(false);
@@ -61,6 +63,7 @@ export const CoaDashboard: React.FC = () => {
   const loadCorridorData = useCallback(async () => {
     try {
       setIsLoading(true);
+      setCorridorError(null);
       const blkPromise =
         dateScope === 'month'
           ? fetchCorridorBlocks(undefined, '2026-09-01', '2026-09-30')
@@ -81,8 +84,9 @@ export const CoaDashboard: React.FC = () => {
       setBlocks(blkData);
       setShadowOpps(shdData);
       setEmergencyCount(emgData.filter((i: EmergencyIncident) => i.status !== 'released').length);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to load COA corridor data:', err);
+      setCorridorError(err?.message || 'Failed to load corridor data from backend');
     } finally {
       setIsLoading(false);
     }
@@ -107,6 +111,26 @@ export const CoaDashboard: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-5">
+      {corridorError && (
+        <div className="bg-amber-50 border border-amber-300 text-amber-900 p-4 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-xs">
+          <div>
+            <p className="font-bold text-xs flex items-center gap-1.5">
+              <span>⚠️</span>
+              Corridor Data Loading Delay / Error
+            </p>
+            <p className="text-[11px] text-amber-700 mt-0.5">
+              Target API: <code className="font-mono bg-white px-1.5 py-0.5 rounded border border-amber-200">{API_BASE || window.location.origin}</code> • Details: {corridorError}
+            </p>
+          </div>
+          <button
+            onClick={() => loadCorridorData()}
+            className="px-3.5 py-1.5 bg-amber-700 hover:bg-amber-800 text-white rounded-xl text-xs font-bold transition shadow-xs flex-shrink-0"
+          >
+            Retry Now
+          </button>
+        </div>
+      )}
+
       {/* Top Banner with KPIs & Controls */}
       <div className="bg-white border border-slate-200/90 rounded-2xl p-5 shadow-sm flex flex-col gap-4 text-slate-800">
         <div className="flex flex-wrap items-center justify-between gap-4">

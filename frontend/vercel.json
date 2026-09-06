@@ -4,6 +4,18 @@
   "framework": "vite",
   "rewrites": [
     {
+      "source": "/health",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/health"
+    },
+    {
+      "source": "/coa/:path*",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/coa/:path*"
+    },
+    {
+      "source": "/departments/:path*",
+      "destination": "https://sih26027-backend-zlbr.onrender.com/departments/:path*"
+    },
+    {
       "source": "/(.*)",
       "destination": "/index.html"
     }

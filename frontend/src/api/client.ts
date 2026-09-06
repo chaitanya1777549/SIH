@@ -37,7 +37,7 @@ const getApiBase = () => {
   return DEFAULT_PROD_API;
 };
 
-const API_BASE = getApiBase();
+export const API_BASE = getApiBase();
 
 export async function checkBackendHealth() {
   try {
