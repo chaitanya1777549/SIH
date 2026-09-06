@@ -1,0 +1,182 @@
+# Explanation of gap_calculator.py
+
+## Purpose
+
+Gap calculation engine for corridor block sections. Computes train occupancies with safety buffers, merges overlapping windows, and determines free time gaps per block section.
+
+## Core Data Structure
+
+`FreeGap` dataclass:
+
+- `gap_id`: int – Sequential identifier for the gap within the section
+- `section_id`: UUID – Identifier of the block section being analyzed
+- `start_min`: int – Start offset from horizon_start (minutes)
+- `end_min`: int – End offset from horizon_start (minutes)
+- `duration_min`: int – Length of the gap in minutes
+- `start_dt`: datetime – Absolute start datetime (timezone-aware UTC)
+- `end_dt`: datetime – Absolute end datetime (timezone-aware UTC)
+
+## Helper: merge_intervals
+
+Merges overlapping or abutting [start, end] intervals (in minutes). Sorts intervals, then merges any that overlap or touch.
+
+## Main Function: compute_section_free_gaps
+
+**Inputs**
+
+- `section_id`: UUID
+- `horizon_start`: datetime (UTC)
+- `horizon_end`: datetime (UTC)
+- `train_movements`: List[Tuple[datetime, datetime]] – (entry_dt, exit_dt) for trains
+- `existing_blocks`: List[Tuple[datetime, datetime]] – Pre‑existing maintenance blocks
+- `safety_buffer_min`: int (default=10) – Minutes added before/after each train movement
+
+**Process**
+
+1. Convert horizon to total minutes.
+2. Build occupied intervals:
+   - For each train movement: apply safety buffer, convert to minute offsets, clamp to horizon.
+   - For each existing block: convert to minute offsets (no buffer), clamp to horizon.
+3. Merge occupied intervals via `merge_intervals`.
+4. Invert merged occupied intervals to find free gaps:
+   - Sweep from horizon start, emitting gaps between occupied intervals.
+   - After last occupied interval, emit gap to horizon end if any time remains.
+5. Return list of `FreeGap` objects.
+
+**Output**
+List of `FreeGap` representing all free time windows in the section within the horizon.
+
+**Notes**
+
+- Timezone handling: naïve datetimes are treated as UTC.
+- Safety buffer applied symmetrically to train movements only.
+- Clamping ensures gaps are reported only within the horizon.
+- Adjacent occupied intervals are merged, preventing zero‑length gaps.
+
+---
+
+# Explanation of cpsat_solver.py
+
+## Purpose
+
+Google OR‑Tools CP‑SAT formulation for corridor block allocation. Maximizes total scheduled criticality score while enforcing:
+
+1. No‑overlap between maintenance blocks on the same section.
+2. Placement exclusively within computed free gaps (respecting train safety buffers).
+3. Completion prior to request deadline (required_by).
+
+## Core Data Structures
+
+- `PendingRequestDTO`: id, source_system, block_section_id, section_code, criticality_score, estimated_duration_min, required_by (optional), defect_code, defect_type.
+- `ScheduledAllocation`: block_request_id, block_section_id, section_code, planned_start, planned_end, duration_min, criticality_score, source_system, defect_code, defect_type.
+- `SolverResult`: status, scheduled_allocations, unscheduled_request_ids, total_criticality, solver_wall_time_sec.
+
+## Main Function: solve_block_allocations
+
+**Inputs**
+
+- `requests`: List[PendingRequestDTO]
+- `section_gaps`: Dict[UUID, List[FreeGap]] – free gaps per section (output of gap_calculator)
+- `horizon_start`: datetime (UTC)
+- `horizon_end`: datetime (UTC)
+- `max_solve_time_sec`: int (default=30) – time limit for solver
+
+**Process (High‑Level)**
+
+1. Validate horizon and requests; return empty result if none.
+2. Create CP‑SAT model.
+3. For each request:
+   - Determine deadline bound in minutes.
+   - Filter eligible gaps (gap duration ≥ request duration and fits before deadline).
+   - If no eligible gaps → mark as definitely unschedulable.
+   - Create Boolean variable `is_sched`, start/end integer variables, optional interval variable.
+   - Create gap‑choice Boolean variables linking start/end to each eligible gap.
+   - Enforce: if scheduled, exactly one gap chosen; if not scheduled, zero gaps chosen.
+4. Add `AddNoOverlap` constraint per section on interval variables.
+5. Objective: maximize sum(criticality_score _ 1000 _ is_sched – start) to prioritize higher criticality and earlier starts.
+6. Solve with CP‑SAT, time‑limited.
+7. Build result:
+   - Collect scheduled requests (solver.BooleanValue(is_sched)).
+   - Compute planned start/end datetimes from minute offsets.
+   - Sum criticality scores.
+   - List unscheduled request IDs (definitely unschedulable + those not selected by solver).
+   - Return `SolverResult` with status, schedule, unscheduled IDs, total criticality, solver wall time.
+
+**Output**
+`SolverResult` containing:
+
+- `status`: CP‑SAT termination status (e.g., OPTIMAL, FEASIBLE).
+- `scheduled_allocations`: List of scheduled blocks with start/end times.
+- `unscheduled_request_ids`: IDs of requests that could not be placed.
+- `total_criticality`: Sum of criticality scores of scheduled blocks.
+- `solver_wall_time_sec`: Actual solve time.
+
+**Notes**
+
+- All datetimes expected timezone‑aware UTC; naïve treated as UTC.
+- Solver respects gap containment, no‑overlap, and deadlines.
+- Objective encourages scheduling high‑criticality jobs early.
+
+---
+
+# Explanation of service.py
+
+## Purpose
+
+Optimization coordinator service. Orchestrates data fetching via SQLAlchemy, gap computation, CP-SAT solve, and transactional write-back to Supabase PostgreSQL.
+
+## Core Data Structures (imported)
+
+- Uses ORM models: `BlockRequest`, `Block`, `BlockAllocationHistory`, `TrainSchedule`, `BlockSection`, defect models (`TMSDefect`, `SMMSDefect`, `TDMSDefect`).
+- Uses DTOs from `cpsat_solver`: `PendingRequestDTO`, `SolverResult`.
+- Uses schemas from `backend.schemas`: `OptimizeResponseSchema`, `AllocationResultSchema`.
+- Uses helpers: `compute_section_free_gaps` and `FreeGap` from `gap_calculator`.
+
+## Main Function: run_corridor_optimization
+
+**Inputs**
+
+- `db`: `sqlalchemy.orm.Session` – active database session.
+- `start_date`: `datetime.date` – first day (inclusive) of planning horizon.
+- `end_date`: `datetime.date` – last day (inclusive) of planning horizon.
+- `safety_buffer_min`: `int` (default=10) – minutes added before/after each train movement when computing gaps.
+- `max_solve_time_sec`: `int` (default=30) – time limit (seconds) for the CP‑SAT solver.
+
+**Process (High‑Level)**
+
+1. **Horizon Construction** – Convert `start_date`/`end_date` to timezone‑aware UTC datetimes (`horizon_start` at 00:00, `horizon_end` at 23:59:59.999).
+2. **Fetch Pending Requests** – Query `BlockRequest` rows with status `"pending"`; eager‑load related section and defect data.
+3. **Early‑Exit** – If no pending requests, return an `OptimizeResponseSchema` with status `"NO_PENDING_REQUESTS"` and zero counts.
+4. **Identify Relevant Sections** – Determine unique `block_section_id`s from the pending requests.
+5. **Gather Train Movements** – Query `TrainSchedule` for forecasts intersecting the horizon for those sections; convert each to `(entry_dt, exit_dt)` tuples grouped by section.
+6. **Gather Existing Active Blocks** – Query `Block` rows with status `"active"` overlapping the horizon for the same sections; convert to `(planned_start, planned_end)` tuples grouped by section.
+7. **Compute Free Gaps** – For each relevant section, call `compute_section_free_gaps` (from `gap_calculator.py`) using the collected train movements, existing blocks, and the supplied safety buffer. Produce a dictionary `section_id → List[FreeGap]`.
+8. **Build Request DTOs** – Transform each `BlockRequest` ORM object into a `PendingRequestDTO` (the format expected by the CP‑SAT solver), pulling `defect_code` and `defect_type` from linked defect rows when present.
+9. **Invoke CP‑SAT Solver** – Call `solve_block_allocations` (from `cpsat_solver.py`) with the DTO list, the gap dictionary, horizon bounds, and time limit. Receive a `SolverResult`.
+10. **Transactional Write‑Back** – Within a single DB transaction:
+    - For each scheduled allocation:
+      - Create a new `Block` row (`status="active"`, `block_type="primary"`, `optimization_run_at` set to now).
+      - Flush to obtain the new block’s ID.
+      - Insert a matching `BlockAllocationHistory` audit record (reason `"initial_allocation"`).
+      - Update the originating `BlockRequest` status to `"allocated"`.
+      - Propagate the `"allocated"` status to the linked defect row (`TMSDefect` / `SMMSDefect` / `TDMSDefect`).
+      - Collect metadata for the response (`AllocationResultSchema` objects).
+    - Commit the transaction; on failure, roll back and re‑raise the exception.
+11. **Compile Response** – Assemble an `OptimizeResponseSchema` containing:
+    - `status`: solver’s termination status (e.g., `"OPTIMAL"`).
+    - `horizon_start` / `horizon_end`.
+    - `total_pending_requests`: count of requests at start.
+    - `scheduled_count` / `unscheduled_count`.
+    - `total_criticality_scheduled`: sum of criticality scores of scheduled blocks.
+    - `allocations`: list of `AllocationResultSchema` (chronologically sorted by `planned_start`).
+    - `unscheduled_request_ids`: IDs of requests not placed.
+    - `execution_time_ms`: total wall‑clock time for the whole service call.
+
+**Output**
+An `OptimizeResponseSchema` instance summarizing the optimization run, including what was scheduled, what remained unscheduled, the achieved criticality, and timing metrics.
+
+**Notes**
+
+- All datetimes are expected to be timezone‑aware UTC; naïve inputs are treated as UTC.
+- The service guarantees atomicity: either all allocations and related updates are persisted, or none are.
+- The function delegates low‑level gap computation and solving to dedicated modules, focusing on orchestration, data access, and transactional persistence.

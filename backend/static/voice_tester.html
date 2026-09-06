@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SIH26027 — Voice & NL Defect Intake Studio</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', sans-serif; }
+    code, pre { font-family: 'JetBrains Mono', monospace; }
+    .pulse-ring {
+      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+      70% { box-shadow: 0 0 0 18px rgba(239, 68, 68, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <!-- Top Navigation -->
+  <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <span class="text-2xl">🚆</span>
+        <div>
+          <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+            SIH26027 Defect Intake Studio
+            <span class="text-xs bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded-full font-medium">Part 6 Live</span>
+          </h1>
+          <p class="text-xs text-slate-400">Visakhapatnam (VSKP) — Vijayawada (BZA) Corridor (350 km)</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <a href="/docs" target="_blank" class="text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-md border border-slate-700 transition">
+          📖 Swagger Docs
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="max-w-4xl mx-auto px-4 py-8 space-y-8">
+    <!-- Intro Banner -->
+    <div class="bg-gradient-to-r from-blue-950/40 via-indigo-950/30 to-slate-900 border border-blue-800/40 rounded-xl p-5">
+      <h2 class="text-base font-semibold text-blue-300 mb-1 flex items-center gap-2">
+        <span>🎙️</span> Speak or Record Defect Report in Plain English / Hindi
+      </h2>
+      <p class="text-xs text-slate-300 leading-relaxed">
+        Speak naturally into your microphone (e.g. <em class="text-amber-300 font-medium">"Observed severe rail fracture near Anakapalle towards Tuni at km 52, needs urgent 90 minute block today."</em>).
+        The system transcribes via <strong class="text-white">Whisper large-v3</strong>, extracts schema fields via <strong class="text-white">openai/gpt-oss-120b</strong>, resolves the section deterministically, calculates Phase C ML criticality, and drafts a complete defect ready for 1-click database insertion.
+      </p>
+    </div>
+
+    <!-- Voice Recording Panel -->
+    <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-6">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+        <div>
+          <h3 class="font-semibold text-white text-base">Direct Microphone Recording</h3>
+          <p class="text-xs text-slate-400">Click to record, speak your report, and click stop</p>
+        </div>
+        <div>
+          <select id="departmentSelect" class="bg-slate-800 border border-slate-700 rounded-lg text-xs px-3 py-1.5 text-slate-200 focus:outline-none focus:border-blue-500">
+            <option value="">Department: Auto-Detect</option>
+            <option value="TMS">TMS (Track / Civil)</option>
+            <option value="SMMS">SMMS (Signal & Telecom)</option>
+            <option value="TDMS">TDMS (Traction / OHE)</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Record Button & Visualizer Area -->
+      <div class="flex flex-col items-center justify-center py-6 space-y-4">
+        <button id="recordBtn" class="relative group bg-rose-600 hover:bg-rose-500 text-white font-bold p-6 rounded-full transition duration-200 transform active:scale-95 shadow-lg shadow-rose-900/30 focus:outline-none">
+          <span id="micIcon" class="text-3xl block">🎙️</span>
+        </button>
+
+        <div id="statusLabel" class="text-sm font-medium text-slate-300 flex items-center gap-2">
+          <span>Click microphone to start speaking</span>
+        </div>
+
+        <div id="timer" class="text-xl font-mono text-amber-400 font-bold hidden">
+          00:00
+        </div>
+
+        <!-- Audio Playback Element -->
+        <audio id="audioPreview" controls class="hidden w-full max-w-md mt-2"></audio>
+      </div>
+
+      <!-- Alternative Input: Upload or Type Text -->
+      <div class="border-t border-slate-800 pt-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+        <div>
+          <label class="block font-medium text-slate-300 mb-1">Or upload an audio recording file:</label>
+          <input type="file" id="audioFileInput" accept="audio/*" class="w-full text-slate-400 file:mr-3 file:py-1.5 file:px-3 file:rounded file:border-0 file:text-xs file:font-semibold file:bg-slate-800 file:text-slate-200 hover:file:bg-slate-700 cursor-pointer">
+        </div>
+        <div>
+          <label class="block font-medium text-slate-300 mb-1">Or paste transcribed text directly:</label>
+          <div class="flex gap-2">
+            <input type="text" id="textInput" placeholder="e.g. Rail fracture at km 52 between AKP and TUNI..." class="bg-slate-800 border border-slate-700 rounded px-2.5 py-1 text-slate-100 flex-1 focus:outline-none focus:border-blue-500">
+            <button id="parseTextBtn" class="bg-blue-600 hover:bg-blue-500 text-white font-medium px-3 py-1 rounded transition">Parse</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Processing Indicator -->
+    <div id="loadingIndicator" class="hidden bg-slate-900 border border-slate-800 rounded-xl p-8 text-center space-y-4 shadow-xl">
+      <div class="inline-block animate-spin rounded-full h-10 w-10 border-4 border-blue-500 border-t-transparent"></div>
+      <div class="space-y-1">
+        <p id="loadingStage" class="text-sm font-semibold text-slate-200">Processing with Groq AI Pipeline...</p>
+        <p class="text-xs text-slate-400">Whisper large-v3 Transcription ➔ gpt-oss-120b Extraction ➔ Corridor Matcher ➔ ML Scorer</p>
+      </div>
+    </div>
+
+    <!-- Results Preview Section -->
+    <div id="resultSection" class="hidden space-y-6">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl space-y-6">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+          <div class="flex items-center gap-2">
+            <span class="text-lg">📋</span>
+            <h3 class="font-bold text-white text-base">Defect Confirmation Preview Card</h3>
+          </div>
+          <span id="severityBadge" class="px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide">
+            CRITICAL
+          </span>
+        </div>
+
+        <!-- Transcription Bubble -->
+        <div class="bg-slate-950/70 border border-slate-800/80 rounded-lg p-3.5 space-y-1">
+          <div class="text-[11px] font-semibold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+            <span>Transcribed Speech (Whisper large-v3)</span>
+            <span id="transcriptionMeta" class="text-slate-500 text-[10px]"></span>
+          </div>
+          <p id="transcriptionText" class="text-sm text-slate-200 font-medium italic"></p>
+        </div>
+
+        <!-- Structured Defect Data Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <!-- Column 1: Defect Attributes -->
+          <div class="space-y-3 bg-slate-950/40 p-3.5 rounded-lg border border-slate-800/50">
+            <h4 class="font-semibold text-blue-400 uppercase tracking-wider text-[11px]">Defect Parameters</h4>
+            <div><span class="text-slate-400">Department:</span> <strong id="defectDept" class="text-slate-100 ml-1"></strong></div>
+            <div><span class="text-slate-400">Defect Type:</span> <strong id="defectType" class="text-slate-100 ml-1"></strong></div>
+            <div><span class="text-slate-400">Description:</span> <span id="defectDesc" class="text-slate-300 ml-1"></span></div>
+            <div><span class="text-slate-400">Duration:</span> <strong id="defectDuration" class="text-amber-400 ml-1"></strong> minutes</div>
+            <div><span class="text-slate-400">Deadline:</span> <span id="defectDeadline" class="text-slate-300 ml-1"></span></div>
+            <div><span class="text-slate-400">Block Needed:</span> <span id="blockFlags" class="text-slate-200 ml-1 font-mono"></span></div>
+          </div>
+
+          <!-- Column 2: Corridor Location & ML Score -->
+          <div class="space-y-3 bg-slate-950/40 p-3.5 rounded-lg border border-slate-800/50">
+            <h4 class="font-semibold text-emerald-400 uppercase tracking-wider text-[11px]">Deterministic Corridor Match</h4>
+            <div><span class="text-slate-400">Section Code:</span> <strong id="sectionCode" class="text-emerald-400 font-mono text-sm ml-1"></strong></div>
+            <div><span class="text-slate-400">Station Pair:</span> <span id="stationPair" class="text-slate-200 ml-1"></span></div>
+            <div><span class="text-slate-400">Track / Direction:</span> <span id="trackDirection" class="text-slate-300 ml-1"></span></div>
+            <div><span class="text-slate-400">Match Method:</span> <span id="matchMethod" class="text-slate-300 ml-1"></span> (Conf: <span id="matchConf" class="text-slate-200"></span>)</div>
+            <div class="text-[11px] text-slate-400 italic" id="matchExplanation"></div>
+          </div>
+        </div>
+
+        <!-- ML Criticality Score Banner -->
+        <div class="bg-indigo-950/30 border border-indigo-800/40 rounded-lg p-4 space-y-2">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <span class="text-base">🤖</span>
+              <span class="text-xs font-semibold text-indigo-300 uppercase tracking-wider">Phase C ML Criticality Score</span>
+            </div>
+            <div class="text-right">
+              <span id="scoreDisplay" class="text-2xl font-bold text-white">90</span>
+              <span class="text-xs text-slate-400">/ 100</span>
+            </div>
+          </div>
+          <p id="scoreJustification" class="text-xs text-slate-300 leading-relaxed"></p>
+        </div>
+
+        <!-- Action Confirmation Button -->
+        <div class="pt-2 flex items-center justify-between gap-4">
+          <button id="discardBtn" class="text-xs text-slate-400 hover:text-slate-200 px-4 py-2 rounded-lg transition">
+            Discard & Record Again
+          </button>
+          <button id="confirmDefectBtn" class="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm px-6 py-2.5 rounded-lg transition flex items-center gap-2 shadow-lg shadow-emerald-900/30">
+            <span>✅</span> Confirm & Create Defect Row in Database
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Success Confirmation Modal/Banner -->
+    <div id="successBanner" class="hidden bg-emerald-950/50 border border-emerald-500/50 rounded-xl p-6 shadow-2xl space-y-3">
+      <div class="flex items-center gap-3">
+        <div class="bg-emerald-500/20 text-emerald-400 p-2 rounded-full text-xl">🎉</div>
+        <div>
+          <h3 class="text-base font-bold text-emerald-400">Defect Created & Saved in Live Database!</h3>
+          <p class="text-xs text-slate-300">Successfully committed to Supabase PostgreSQL defect table.</p>
+        </div>
+      </div>
+      <div class="bg-slate-900/80 rounded-lg p-3 font-mono text-xs text-slate-300 space-y-1">
+        <div><span class="text-slate-500">Defect Code :</span> <strong id="savedCode" class="text-emerald-300"></strong></div>
+        <div><span class="text-slate-500">Database ID :</span> <span id="savedId" class="text-slate-400"></span></div>
+        <div><span class="text-slate-500">Status      :</span> <span class="text-amber-400 font-semibold">open (queued for optimizer)</span></div>
+        <div><span class="text-slate-500">Input Source:</span> <span id="savedSource" class="text-blue-400"></span></div>
+      </div>
+      <div class="pt-2 flex gap-3">
+        <button onclick="location.reload()" class="bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 px-4 py-2 rounded transition">
+          Record Another Issue
+        </button>
+        <a href="/docs" target="_blank" class="bg-emerald-600 hover:bg-emerald-500 text-xs text-white px-4 py-2 rounded transition">
+          View in Database / API
+        </a>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    // Audio recording state
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let recordInterval = null;
+    let recordSeconds = 0;
+    let currentPreviewData = null;
+
+    const recordBtn = document.getElementById('recordBtn');
+    const micIcon = document.getElementById('micIcon');
+    const statusLabel = document.getElementById('statusLabel');
+    const timer = document.getElementById('timer');
+    const audioPreview = document.getElementById('audioPreview');
+    const loadingIndicator = document.getElementById('loadingIndicator');
+    const resultSection = document.getElementById('resultSection');
+    const successBanner = document.getElementById('successBanner');
+    const confirmDefectBtn = document.getElementById('confirmDefectBtn');
+    const discardBtn = document.getElementById('discardBtn');
+    const audioFileInput = document.getElementById('audioFileInput');
+    const parseTextBtn = document.getElementById('parseTextBtn');
+    const textInput = document.getElementById('textInput');
+    const departmentSelect = document.getElementById('departmentSelect');
+
+    // 1. Microphone Record Handler
+    recordBtn.addEventListener('click', async () => {
+      if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        startRecording();
+      } else if (mediaRecorder.state === 'recording') {
+        stopRecording();
+      }
+    });
+
+    async function startRecording() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) audioChunks.push(event.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+          const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+          audioPreview.src = URL.createObjectURL(audioBlob);
+          audioPreview.classList.remove('hidden');
+          stream.getTracks().forEach(track => track.stop());
+
+          // Send to API
+          await submitAudioToApi(audioBlob, 'voice_report.webm');
+        };
+
+        mediaRecorder.start();
+        recordSeconds = 0;
+        timer.classList.remove('hidden');
+        timer.textContent = '00:00';
+        recordInterval = setInterval(() => {
+          recordSeconds++;
+          const mins = String(Math.floor(recordSeconds / 60)).padStart(2, '0');
+          const secs = String(recordSeconds % 60).padStart(2, '0');
+          timer.textContent = `${mins}:${secs}`;
+        }, 1000);
+
+        recordBtn.classList.add('pulse-ring', 'bg-red-700');
+        micIcon.textContent = '⏹️';
+        statusLabel.innerHTML = '<span class="text-rose-400 font-semibold animate-pulse">● Recording... Click stop when done</span>';
+      } catch (err) {
+        alert('Could not access microphone: ' + err.message + '\nYou can also upload an audio file below.');
+      }
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+        clearInterval(recordInterval);
+        recordBtn.classList.remove('pulse-ring', 'bg-red-700');
+        micIcon.textContent = '🎙️';
+        statusLabel.innerHTML = '<span>Processing audio...</span>';
+      }
+    }
+
+    // 2. Submit Audio to Backend API
+    async function submitAudioToApi(audioBlob, filename) {
+      resultSection.classList.add('hidden');
+      successBanner.classList.add('hidden');
+      loadingIndicator.classList.remove('hidden');
+
+      const formData = new FormData();
+      formData.append('file', audioBlob, filename);
+      const dept = departmentSelect.value;
+      if (dept) formData.append('department', dept);
+
+      try {
+        const resp = await fetch('/departments/voice-intake-and-parse', {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json();
+          throw new Error(err.detail || 'Voice processing failed');
+        }
+
+        const data = await resp.json();
+        renderPreview(data);
+      } catch (err) {
+        alert('Error processing voice report: ' + err.message);
+      } finally {
+        loadingIndicator.classList.add('hidden');
+        statusLabel.innerHTML = '<span>Click microphone to record another report</span>';
+      }
+    }
+
+    // 3. Audio File Upload Handler
+    audioFileInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        await submitAudioToApi(file, file.name);
+      }
+    });
+
+    // 4. Text Input Parse Handler
+    parseTextBtn.addEventListener('click', async () => {
+      const text = textInput.value.trim();
+      if (!text) return alert('Please enter report text.');
+
+      resultSection.classList.add('hidden');
+      successBanner.classList.add('hidden');
+      loadingIndicator.classList.remove('hidden');
+
+      try {
+        const resp = await fetch('/departments/parse-defect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: text,
+            department: departmentSelect.value || null
+          })
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json();
+          throw new Error(err.detail || 'Text parse failed');
+        }
+
+        const data = await resp.json();
+        renderPreview(data);
+      } catch (err) {
+        alert('Error parsing text: ' + err.message);
+      } finally {
+        loadingIndicator.classList.add('hidden');
+      }
+    });
+
+    // 5. Render Preview Card
+    function renderPreview(data) {
+      currentPreviewData = data;
+      const draft = data.draft_defect;
+      const loc = data.location_match;
+      const crit = data.preview_criticality;
+      const trans = data.audio_transcription;
+
+      // Severity badge
+      const badge = document.getElementById('severityBadge');
+      badge.textContent = draft.severity;
+      if (draft.severity === 'critical') {
+        badge.className = 'px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide bg-rose-500/20 text-rose-400 border border-rose-500/30';
+      } else if (draft.severity === 'high') {
+        badge.className = 'px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide bg-amber-500/20 text-amber-400 border border-amber-500/30';
+      } else {
+        badge.className = 'px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wide bg-blue-500/20 text-blue-400 border border-blue-500/30';
+      }
+
+      // Transcription
+      document.getElementById('transcriptionText').textContent = `"${trans ? trans.transcription : data.raw_text}"`;
+      document.getElementById('transcriptionMeta').textContent = trans ? `Model: ${trans.transcription_model}` : 'Direct Text Input';
+
+      // Defect Parameters
+      document.getElementById('defectDept').textContent = draft.department;
+      document.getElementById('defectType').textContent = draft.defect_type;
+      document.getElementById('defectDesc').textContent = draft.description;
+      document.getElementById('defectDuration').textContent = draft.estimated_duration_min;
+      document.getElementById('defectDeadline').textContent = new Date(draft.required_by).toLocaleString();
+      document.getElementById('blockFlags').textContent = `Track:${draft.requires_track_block} | Signal:${draft.requires_signal_block} | Power:${draft.requires_power_block}`;
+
+      // Corridor Match
+      document.getElementById('sectionCode').textContent = loc.section_code;
+      document.getElementById('stationPair').textContent = `${loc.from_station_code} ➔ ${loc.to_station_code}`;
+      document.getElementById('trackDirection').textContent = `${loc.track_code} (${loc.direction} Line)`;
+      document.getElementById('matchMethod').textContent = loc.match_method;
+      document.getElementById('matchConf').textContent = `${(loc.confidence * 100).toFixed(0)}%`;
+      document.getElementById('matchExplanation').textContent = loc.explanation;
+
+      // ML Score
+      document.getElementById('scoreDisplay').textContent = crit.predicted_score;
+      document.getElementById('scoreJustification').textContent = crit.justification;
+
+      resultSection.classList.remove('hidden');
+      resultSection.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // 6. Confirm & Insert Defect into DB
+    confirmDefectBtn.addEventListener('click', async () => {
+      if (!currentPreviewData) return;
+      const draft = currentPreviewData.draft_defect;
+
+      confirmDefectBtn.disabled = true;
+      confirmDefectBtn.textContent = 'Saving into Supabase...';
+
+      try {
+        const payload = {
+          defect_code: `${draft.department}-V-${Math.random().toString(36).substr(2, 6).toUpperCase()}`,
+          block_section_id: draft.block_section_id,
+          defect_type: draft.defect_type,
+          description: draft.description,
+          severity: draft.severity,
+          criticality_score: draft.criticality_score,
+          required_by: draft.required_by,
+          estimated_duration_min: draft.estimated_duration_min,
+          work_category: draft.work_category,
+          input_source: draft.input_source,
+          raw_report_text: draft.raw_report_text,
+          requires_block: draft.requires_block
+        };
+
+        const resp = await fetch(`/departments/${draft.department}/defects`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+          const err = await resp.json();
+          throw new Error(err.detail || 'Failed to save defect');
+        }
+
+        const saved = await resp.json();
+        resultSection.classList.add('hidden');
+        successBanner.classList.remove('hidden');
+        document.getElementById('savedCode').textContent = saved.defect_code;
+        document.getElementById('savedId').textContent = saved.id;
+        document.getElementById('savedSource').textContent = saved.input_source;
+        successBanner.scrollIntoView({ behavior: 'smooth' });
+      } catch (err) {
+        alert('Error saving defect: ' + err.message);
+      } finally {
+        confirmDefectBtn.disabled = false;
+        confirmDefectBtn.innerHTML = '<span>✅</span> Confirm & Create Defect Row in Database';
+      }
+    });
+
+    discardBtn.addEventListener('click', () => {
+      resultSection.classList.add('hidden');
+      currentPreviewData = null;
+    });
+  </script>
+</body>
+</html>
