@@ -16,7 +16,28 @@ import {
   ReOptimizeResult,
 } from '../types';
 
-const API_BASE = ((import.meta as any).env?.VITE_API_BASE_URL || '').replace(/\/$/, ''); // Uses VITE_API_BASE_URL if set (production), or Vite proxy if empty (dev)
+const DEFAULT_PROD_API = 'https://sih26027-backend-zlbr.onrender.com';
+
+const getApiBase = () => {
+  // 1. Explicit VITE_API_BASE_URL environment variable takes highest priority
+  const envUrl = (import.meta as any).env?.VITE_API_BASE_URL;
+  if (envUrl && typeof envUrl === 'string' && envUrl.trim().length > 0) {
+    return envUrl.trim().replace(/\/$/, '');
+  }
+
+  // 2. If running locally on localhost or 127.0.0.1, use Vite proxy ('')
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    if (host === 'localhost' || host === '127.0.0.1') {
+      return '';
+    }
+  }
+
+  // 3. Fallback for production cloud deployments (Vercel, etc.)
+  return DEFAULT_PROD_API;
+};
+
+const API_BASE = getApiBase();
 
 export async function checkBackendHealth() {
   try {
