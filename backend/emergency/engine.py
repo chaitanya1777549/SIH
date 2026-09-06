@@ -4,12 +4,12 @@ Handles:
 1. Emergency incident creation & asset identification.
 2. Train approach and corridor conflict analysis.
 3. Rule-based heuristic action recommendation (Hold / Divert / Block / Notify).
-4. Multi-option block evaluation:
-   - Safe sustainable time verification (disqualifies late shadow or gap windows).
-   - Option A: Immediate Emergency Track Closure (+15m, full isolation).
-   - Option B: Targeted Single-Train Hold/Delay (delays 1 train to secure 2h window).
-   - Option C: Immediate Shadow Piggyback (if starting well before emergency deadline).
-   - Option D: Earliest Natural Gap (if sustainable without train interference).
+4. Multi-option emergency block evaluation (Emergency blocks are dedicated primary possessions and are NEVER checked for shadow blocks):
+   - Safe sustainable time verification (disqualifies delayed gap windows).
+   - Option 1: Immediate Emergency Track Closure (+15m, full isolation).
+   - Option 2: Single-Line Bi-Directional Working / Divert Traffic.
+   - Option 3: Targeted Single-Train Hold or Staggered Resource Possession.
+   - Option 4: Earliest Sustainable Natural Gap.
 5. Controller confirmation, atomic emergency block creation, audit logging, and safety release flow.
 """
 import uuid
@@ -235,12 +235,12 @@ def generate_emergency_block_options(
     reference_time: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Computes realistic, concrete candidate block options:
-    - Enforces maximum sustainable time (disqualifies late shadow or delayed gap windows).
-    - Option 1: Immediate Emergency Closure (+15m, full isolation).
-    - Option 2: Targeted Single-Train Hold (delay 1 train to secure 2h window).
-    - Option 3: Shadow Piggyback (if starting well before emergency deadline).
-    - Option 4: Earliest Natural Gap (if sustainable without train disruption).
+    Computes realistic, concrete candidate emergency block options:
+    (Rule: Emergency blocks are dedicated safety possessions and are NEVER checked for shadow blocks)
+    - Option 1: Immediate Emergency Closure (+15m, full isolation, hold approaching trains at loops).
+    - Option 2: Single-Line Bi-Directional Working / Divert Traffic (30 km/h pilot caution).
+    - Option 3: Tactical Staggered Hold / Mobilization Runway (only 1 train regulated or crew dispatch).
+    - Option 4: Earliest Sustainable Natural Gap (if fitting before maximum safe emergency deadline).
     """
     now = reference_time or datetime.now(timezone.utc)
     dept, defect = get_incident_defect(incident, db)
@@ -361,47 +361,6 @@ def generate_emergency_block_options(
         })
 
     # -------------------------------------------------------------
-    # Option 3: Immediate Shadow Piggyback (Strict Sustainable Check)
-    # -------------------------------------------------------------
-    candidate_parents = (
-        db.query(Block)
-        .options(joinedload(Block.block_request))
-        .filter(
-            Block.block_section_id == sec.id,
-            Block.status == "active",
-            Block.block_type == "primary",
-            Block.planned_start >= now,
-        )
-        .order_by(Block.planned_start.asc())
-        .all()
-    )
-
-    for p in candidate_parents:
-        p_dur = int((p.planned_end - p.planned_start).total_seconds() // 60)
-        # Check duration and SUSTAINABLE TIME RULE
-        if p_dur >= required_duration_min and p.planned_start <= max_safe_time:
-            shadow_end = p.planned_start + timedelta(minutes=required_duration_min)
-            options.append({
-                "option_id": f"opt-shadow-{str(p.id)[:8]}",
-                "label": "Option 3: Shadow Block Piggyback (Zero Additional Delay)",
-                "planned_start": p.planned_start.isoformat(),
-                "planned_end": shadow_end.isoformat(),
-                "duration_min": required_duration_min,
-                "trains_affected_count": 0,
-                "affected_train_numbers": [],
-                "total_delay_minutes": 0,
-                "is_shadow": True,
-                "parent_block_id": str(p.id),
-                "resource_impact": "Zero extra corridor capacity consumed; shares existing approved track closure.",
-                "sustainable": True,
-                "description": (
-                    f"Piggyback on existing primary block ({p.planned_start.strftime('%H:%M')} - {p.planned_end.strftime('%H:%M')}). "
-                    f"Starts before emergency limit ({max_safe_time.strftime('%H:%M')}). 0 trains delayed."
-                ),
-            })
-            break # Only surface the earliest viable shadow block
-
-    # -------------------------------------------------------------
     # Option 4: Earliest Natural Gap (Strict Sustainable Check)
     # -------------------------------------------------------------
     # Compute free gaps on this section for today
@@ -504,8 +463,6 @@ def confirm_emergency_decision(
 
         planned_start = datetime.fromisoformat(chosen_opt["planned_start"])
         planned_end = datetime.fromisoformat(chosen_opt["planned_end"])
-        is_shadow = chosen_opt.get("is_shadow", False)
-        parent_id = chosen_opt.get("parent_block_id")
 
         # 1. Create BlockRequest with is_emergency=True
         req = BlockRequest(
@@ -524,15 +481,15 @@ def confirm_emergency_decision(
         db.flush()
         created_request_id = req.id
 
-        # 2. Create Block
+        # 2. Create Block (Emergency blocks are dedicated primary possessions, never shadow blocks)
         block = Block(
             block_request_id=req.id,
             block_section_id=sec.id,
             planned_start=planned_start,
             planned_end=planned_end,
             status="active",
-            block_type="shadow" if is_shadow else "primary",
-            parent_block_id=UUID(parent_id) if parent_id else None,
+            block_type="primary",
+            parent_block_id=None,
         )
         db.add(block)
         db.flush()
@@ -643,7 +600,7 @@ def confirm_emergency_decision(
         EmergencyIncident.block_section_id == incident.block_section_id,
         EmergencyIncident.id != incident.id,
         EmergencyIncident.status.in_(["reported", "action_recommended", "escalated_emergency"])
-    ).update({"status": "confirmed", "controller_decision": "superseded"}, synchronize_session=False)
+    ).update({"status": "confirmed", "controller_decision": decision_lower}, synchronize_session=False)
 
     db.commit()
 
@@ -743,11 +700,9 @@ def evaluate_crucial_defect_pipeline(
     Automated triage pipeline for crucial department defects:
     1. Checks if a natural free gap can accommodate the defect before required_by.
        If YES -> Schedules standard block request in that gap (No emergency escalation).
-    2. Checks if an active/planned primary block on the section can host a shadow block.
-       If YES -> Proposes shadow block piggyback (No emergency escalation).
-    3. If NEITHER a free gap NOR a shadow block is viable before deadline:
-       AUTOMATICALLY INVOKES EMERGENCY MODE!
-       Creates EmergencyIncident and generates multi-option tactical trade-off cards (Hold / Divert / Immediate Block).
+    2. If NO free timetable gap exists before the deadline:
+       AUTOMATICALLY INVOKES EMERGENCY MODE! (Rule: Emergency blocks are NEVER checked for shadow blocks).
+       Creates EmergencyIncident and generates multi-option tactical trade-off cards (Hold / Divert / Immediate Block / Natural Gap).
     """
     now = reference_time or datetime.now(timezone.utc)
     if not required_by or (required_by.tzinfo and required_by <= now):
@@ -822,48 +777,8 @@ def evaluate_crucial_defect_pipeline(
             }
 
     # -------------------------------------------------------------
-    # Cascade Step 2: Check Shadow Block Opportunity before required_by
-    # -------------------------------------------------------------
-    candidate_parents = (
-        db.query(Block)
-        .filter(
-            Block.block_section_id == sec.id,
-            Block.status == "active",
-            Block.block_type == "primary",
-            Block.planned_start >= now,
-            Block.planned_start <= required_by,
-        )
-        .order_by(Block.planned_start.asc())
-        .all()
-    )
-
-    for p in candidate_parents:
-        p_dur = int((p.planned_end - p.planned_start).total_seconds() // 60)
-        if p_dur >= estimated_duration_min:
-            shadow_end = p.planned_start + timedelta(minutes=estimated_duration_min)
-            add_notification(
-                department=source_system,
-                notif_type="GREEN",
-                title=f"SHADOW BLOCK OPPORTUNITY: {sec.section_code}",
-                message=f"Can piggyback within primary block #{str(p.id)[:8]} ({p.planned_start.strftime('%H:%M')} - {p.planned_end.strftime('%H:%M')}). 0 min extra delay.",
-                section_code=sec.section_code,
-                action_taken="SHADOW_PROPOSED",
-            )
-            return {
-                "cascade_step": "shadow_block_found",
-                "requires_emergency": False,
-                "message": f"Shadow block piggyback available within Block #{str(p.id)[:8]}. Zero additional delay.",
-                "parent_block_id": str(p.id),
-                "proposed_start": p.planned_start.isoformat(),
-                "proposed_end": shadow_end.isoformat(),
-                "duration_min": estimated_duration_min,
-                "deadline": required_by.isoformat(),
-                "incident_id": None,
-                "options": [],
-            }
-
-    # -------------------------------------------------------------
-    # Cascade Step 3: Neither Gap nor Shadow -> AUTOMATICALLY INVOKE EMERGENCY!
+    # Cascade Step 2: No Free Gap before deadline -> AUTOMATICALLY INVOKE EMERGENCY!
+    # (RULE: Emergency blocks are NEVER checked for shadow blocks!)
     # -------------------------------------------------------------
     incident = create_emergency_incident(
         db=db,
@@ -888,7 +803,7 @@ def evaluate_crucial_defect_pipeline(
         department=source_system,
         notif_type="RED",
         title=f"🚨 EMERGENCY INVOKED: {sec.section_code}",
-        message=f"No free gap or shadow window available before {required_by.strftime('%H:%M')}. Emergency mode automatically triggered! Siren alert activated at COA.",
+        message=f"No free timetable gap available before {required_by.strftime('%H:%M')}. Emergency mode automatically triggered! Siren alert activated at COA.",
         section_code=sec.section_code,
         action_taken="EMERGENCY_INVOKED",
     )
@@ -896,7 +811,7 @@ def evaluate_crucial_defect_pipeline(
     return {
         "cascade_step": "emergency_invoked",
         "requires_emergency": True,
-        "message": f"CRITICAL EMERGENCY: No free gap or shadow block available before {required_by.strftime('%H:%M')}. Emergency mode automatically invoked with active siren alert at COA.",
+        "message": f"CRITICAL EMERGENCY: No free timetable gap available before {required_by.strftime('%H:%M')}. Emergency mode automatically invoked with active siren alert at COA.",
         "incident_id": str(incident.id),
         "section_code": sec.section_code,
         "deadline": required_by.isoformat(),

@@ -219,22 +219,43 @@ def test_controller_confirm_block_option_creates_emergency_block():
         assert db_block.status == "completed"
 
     finally:
-        # Cleanup
-        if block_id:
-            db.query(BlockAllocationHistory).filter(BlockAllocationHistory.block_id == block_id).delete()
-            db.query(Block).filter(Block.id == block_id).delete()
+        # Cleanup in proper FK order
         if incident_id:
             inc = db.query(EmergencyIncident).filter(EmergencyIncident.id == incident_id).first()
+            d_id = inc.tms_defect_id if inc else None
             if inc:
-                d_id = inc.tms_defect_id
                 inc.block_request_id = None
                 db.flush()
                 db.delete(inc)
                 db.flush()
-                if req_id:
-                    db.query(BlockRequest).filter(BlockRequest.id == req_id).delete()
-                if d_id:
-                    db.query(TMSDefect).filter(TMSDefect.id == d_id).delete()
+
+            # Find any related block requests
+            b_req_ids = [r.id for r in db.query(BlockRequest).filter(
+                (BlockRequest.id == req_id) | (BlockRequest.tms_defect_id == d_id)
+            ).all()] if (req_id or d_id) else []
+            if req_id and req_id not in b_req_ids:
+                b_req_ids.append(req_id)
+
+            # Find any blocks
+            blk_ids = [b.id for b in db.query(Block).filter(
+                (Block.block_request_id.in_(b_req_ids)) | (Block.id == block_id)
+            ).all()] if b_req_ids or block_id else []
+            if block_id and block_id not in blk_ids:
+                blk_ids.append(block_id)
+
+            if blk_ids:
+                db.query(BlockAllocationHistory).filter(BlockAllocationHistory.block_id.in_(blk_ids)).delete(synchronize_session=False)
+                db.query(Block).filter(Block.id.in_(blk_ids)).delete(synchronize_session=False)
+            if b_req_ids:
+                db.query(BlockAllocationHistory).filter(BlockAllocationHistory.block_request_id.in_(b_req_ids)).delete(synchronize_session=False)
+                db.query(BlockRequest).filter(BlockRequest.id.in_(b_req_ids)).delete(synchronize_session=False)
+            if d_id:
+                db.query(TMSDefect).filter(TMSDefect.id == d_id).delete(synchronize_session=False)
+        elif block_id:
+            db.query(BlockAllocationHistory).filter(BlockAllocationHistory.block_id == block_id).delete(synchronize_session=False)
+            db.query(Block).filter(Block.id == block_id).delete(synchronize_session=False)
+            if req_id:
+                db.query(BlockRequest).filter(BlockRequest.id == req_id).delete(synchronize_session=False)
         db.commit()
         db.close()
 

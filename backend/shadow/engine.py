@@ -62,6 +62,9 @@ def find_shadow_candidates_for_block(
     if primary_block.block_type == "shadow":
         raise HTTPException(status_code=400, detail="Cannot attach a shadow block to another shadow block.")
 
+    if primary_block.block_type == "emergency" or getattr(primary_block.block_request, "is_emergency", False):
+        raise HTTPException(status_code=400, detail="Emergency blocks are dedicated safety possessions and cannot be checked or used for shadow blocks.")
+
     sec = primary_block.block_section
     sec_id = primary_block.block_section_id
     primary_dur_min = int((primary_block.planned_end - primary_block.planned_start).total_seconds() // 60)
@@ -75,7 +78,7 @@ def find_shadow_candidates_for_block(
 
     candidates: List[ShadowCandidateSchema] = []
 
-    # 1. Search pending BlockRequests on the same section (excluding current primary block's request)
+    # 1. Search pending BlockRequests on the same section (excluding current primary block's request and emergency requests)
     pending_reqs = (
         db.query(BlockRequest)
         .options(
@@ -86,6 +89,7 @@ def find_shadow_candidates_for_block(
         .filter(
             BlockRequest.block_section_id == sec_id,
             BlockRequest.status == "pending",
+            BlockRequest.is_emergency == False,
             BlockRequest.id != primary_block.block_request_id,
         )
         .all()
@@ -254,6 +258,7 @@ def find_all_corridor_shadow_opportunities(
     """
     active_primary_blocks = (
         db.query(Block)
+        .join(BlockRequest, Block.block_request_id == BlockRequest.id)
         .options(
             joinedload(Block.block_section).joinedload(BlockSection.from_station),
             joinedload(Block.block_section).joinedload(BlockSection.to_station),
@@ -261,7 +266,11 @@ def find_all_corridor_shadow_opportunities(
             joinedload(Block.block_request).joinedload(BlockRequest.smms_defect),
             joinedload(Block.block_request).joinedload(BlockRequest.tdms_defect),
         )
-        .filter(Block.status == "active", Block.block_type == "primary")
+        .filter(
+            Block.status == "active",
+            Block.block_type == "primary",
+            BlockRequest.is_emergency == False,
+        )
         .order_by(Block.planned_start.asc())
         .all()
     )
@@ -271,7 +280,7 @@ def find_all_corridor_shadow_opportunities(
 
     sec_ids = {b.block_section_id for b in active_primary_blocks if b.block_section_id}
 
-    # 1. Fetch pending BlockRequests on all relevant sections in ONE query
+    # 1. Fetch pending BlockRequests on all relevant sections in ONE query (excluding emergency requests)
     pending_reqs_all = (
         db.query(BlockRequest)
         .options(
@@ -282,6 +291,7 @@ def find_all_corridor_shadow_opportunities(
         .filter(
             BlockRequest.block_section_id.in_(sec_ids),
             BlockRequest.status == "pending",
+            BlockRequest.is_emergency == False,
         )
         .all()
     )

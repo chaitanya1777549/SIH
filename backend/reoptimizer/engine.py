@@ -318,18 +318,81 @@ def resolve_conflicts_and_reoptimize(
         est_duration = req.estimated_duration_min if req else int((prev_end - prev_start).total_seconds() // 60)
         req_deadline = req.required_by if req else None
 
+        is_emergency = (
+            getattr(req, "is_emergency", False)
+            or block.block_type == "emergency"
+            or dept == "EMERGENCY"
+            or (req and req.source_system == "EMERGENCY")
+        )
+
+        # -------------------------------------------------------------------------
+        # EMERGENCY BLOCK CHECK:
+        # Rule: Emergency blocks are NEVER checked for shadow blocks!
+        # Safety possession is non-negotiable; block preserved, train halted/diverted.
+        # -------------------------------------------------------------------------
+        if is_emergency:
+            for sched in conflicting_scheds:
+                sched.status = "diverted"
+                sched.updated_at = datetime.now(timezone.utc)
+                diverted_count += 1
+                t = sched.train
+
+                notif_urgent = add_notification(
+                    department="COA",
+                    notif_type="BLUE",
+                    title=f"URGENT DIRECTIVE: EMERGENCY BLOCK ACTIVE — DIVERT OR HALT TRAIN {t.train_number} on {sec.section_code}",
+                    message=(
+                        f"EMERGENCY BLOCK DIRECTIVE: Train {t.train_number} delayed into active EMERGENCY safety block "
+                        f"({block.planned_start.strftime('%H:%M')} - {block.planned_end.strftime('%H:%M')}) on {sec.section_code}. "
+                        f"Emergency blocks are never checked for shadow blocks or deferred. "
+                        f"Block PRESERVED. COA DIRECTIVE: DIVERT Train {t.train_number} via adjacent track or "
+                        f"HALT at upstream station loop line."
+                    ),
+                    defect_code=defect_code,
+                    section_code=sec.section_code,
+                    action_taken="EMERGENCY_TRAIN_DIVERT_OR_HALT",
+                )
+                generated_notifications.append(DepartmentNotificationSchema(**notif_urgent))
+
+                details.append(
+                    ConflictResolutionDetailSchema(
+                        conflict_type="train_vs_block",
+                        section_code=sec.section_code,
+                        train_number=t.train_number,
+                        train_forecast_entry=sched.forecast_entry,
+                        train_forecast_exit=sched.forecast_exit,
+                        block_id=block.id,
+                        block_planned_start=block.planned_start,
+                        block_planned_end=block.planned_end,
+                        defect_code=defect_code,
+                        defect_department=dept,
+                        criticality_score=crit_score,
+                        severity=severity,
+                        decision="train_divert_or_halt",
+                        rescheduled_slot=None,
+                        notes=(
+                            f"Active Emergency Block on {sec.section_code}. Emergency blocks are never checked for shadow blocks. "
+                            f"Block preserved; COA notified to DIVERT or HALT Train {t.train_number}."
+                        ),
+                    )
+                )
+            continue
+
         # -------------------------------------------------------------------------
         # STAGE 1: Check for viable SHADOW BLOCK piggyback before defect deadline
+        # (Only for routine / planned maintenance blocks; never for emergency blocks)
         # -------------------------------------------------------------------------
         rescheduled = False
         rescheduled_info: Optional[Dict[str, Any]] = None
 
         candidate_parents = (
             db.query(Block)
+            .join(BlockRequest, Block.block_request_id == BlockRequest.id)
             .filter(
                 Block.block_section_id == sec.id,
                 Block.status == "active",
                 Block.block_type == "primary",
+                BlockRequest.is_emergency == False,
                 Block.id != block.id,
                 Block.planned_start >= block.planned_start,
             )
